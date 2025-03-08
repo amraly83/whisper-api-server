@@ -6,18 +6,18 @@ from config import settings
 
 app = FastAPI(title="Whisper API Server")
 
-# Fix the model initialization
+# Fix the model initialization - the first parameter is positional, not named
 try:
     print(f"Loading model: size={settings.whisper_model_size}, device={settings.device}, compute_type={settings.compute_type}")
+    # The model_size should be a positional argument, not a keyword argument
     model = WhisperModel(
-        model_size=settings.whisper_model_size,  # Add the parameter name
+        settings.whisper_model_size,  # Remove the parameter name
         device=settings.device, 
         compute_type=settings.compute_type
     )
     print("Model loaded successfully")
 except Exception as e:
     print(f"Error loading model: {e}")
-    # Provide a fallback or exit if model can't be loaded
     raise
 
 @app.get("/")
