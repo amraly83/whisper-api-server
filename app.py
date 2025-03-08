@@ -1,27 +1,30 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import JSONResponse
 from faster_whisper import WhisperModel
 import tempfile
 import os
-import uuid
-import json
 from config import settings
 
 app = FastAPI(title="Whisper API Server")
 
-# Initialize the model using settings
-print(f"Loading model: size={settings.model_size}, device={settings.device}, compute_type={settings.compute_type}")
-model = WhisperModel(
-    settings.model_size, 
-    device=settings.device, 
-    compute_type=settings.compute_type
-)
+# Fix the model initialization
+try:
+    print(f"Loading model: size={settings.whisper_model_size}, device={settings.device}, compute_type={settings.compute_type}")
+    model = WhisperModel(
+        model_size=settings.whisper_model_size,  # Add the parameter name
+        device=settings.device, 
+        compute_type=settings.compute_type
+    )
+    print("Model loaded successfully")
+except Exception as e:
+    print(f"Error loading model: {e}")
+    # Provide a fallback or exit if model can't be loaded
+    raise
 
 @app.get("/")
 async def root():
     return {
         "message": "Whisper API is running",
-        "model_size": settings.model_size,
+        "model_size": settings.whisper_model_size,
         "device": settings.device
     }
 
