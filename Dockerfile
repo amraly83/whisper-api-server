@@ -13,6 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE 8000
+# Change the exposed port to 8083
+EXPOSE 8083
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Update the command to use port 8083
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8083"]

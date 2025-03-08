@@ -16,4 +16,4 @@ A Docker-based API server for OpenAI's Whisper speech-to-text model, compatible 
 
 ```bash
 docker build -t whisper-api .
-docker run -d -p 8000:8000 --memory=4g --name whisper-server whisper-api
+docker run -d -p 8083:8083 --memory=4g --name whisper-server whisper-api
