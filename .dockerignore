@@ -1,0 +1,11 @@
+pycache/
+*.py[cod]
+*$py.class
+.env
+venv/
+.git/
+.gitignore
+README.md
+*.wav
+*.mp3
+*.mp4

@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env.local
+venv/
+.idea/
+.vscode/
+*.wav
+*.mp3
+*.mp4
+*.m4a
+*.ogg
+*.webm
