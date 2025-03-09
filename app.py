@@ -10,7 +10,7 @@ app = FastAPI(title="Whisper API Server")
 try:
     print(f"Loading model: size={settings.whisper_model_size}, device={settings.device}, compute_type={settings.compute_type}")
     # The model_size should be a positional argument, not a keyword argument
-    model_name = WhisperModel(
+    whisper_model = WhisperModel(
         settings.whisper_model_size,  # Remove the parameter name
         device=settings.device, 
         compute_type=settings.compute_type
@@ -64,7 +64,7 @@ async def transcribe(
         
         # Transcribe the audio
         print(f"Starting transcription for file: {file.filename}")
-        segments, info = model.transcribe(
+        segments, info = whisper_model.transcribe(
             temp_file.name,
             language=language,
             initial_prompt=prompt,
