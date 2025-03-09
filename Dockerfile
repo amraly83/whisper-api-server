@@ -2,11 +2,12 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system dependencies including ffmpeg
+# Install system dependencies including ffmpeg and curl
 RUN apt-get update && apt-get install -y \
     build-essential \
     git \
     ffmpeg \
+    curl \  # Add curl for health checks
     && rm -rf /var/lib/apt/lists/*
 
 # Copy only requirements first to leverage Docker caching
