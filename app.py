@@ -10,7 +10,7 @@ app = FastAPI(title="Whisper API Server")
 try:
     print(f"Loading model: size={settings.whisper_model_size}, device={settings.device}, compute_type={settings.compute_type}")
     # The model_size should be a positional argument, not a keyword argument
-    model = WhisperModel(
+    model_name = WhisperModel(
         settings.whisper_model_size,  # Remove the parameter name
         device=settings.device, 
         compute_type=settings.compute_type
@@ -41,7 +41,7 @@ async def transcribe(
     response_format: str = Form(default="json"),
     temperature: float = Form(default=0),
 ):
-    model_param = model
+
     # Validate response format
     if response_format not in ["json", "text", "srt", "verbose_json", "vtt"]:
         raise HTTPException(status_code=400, detail="Unsupported response format")
