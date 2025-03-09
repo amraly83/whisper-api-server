@@ -47,7 +47,7 @@ async def transcribe(
     
     # Create a temporary file
     temp_file = tempfile.NamedTemporaryFile(delete=False)
-    temp_file.close()
+    print(f"Created temporary file: {temp_file.name}")
     
     try:
         # Save the uploaded file to the temporary file
@@ -62,6 +62,7 @@ async def transcribe(
             raise HTTPException(status_code=400, detail=f"Unsupported file format: {file_ext}")
         
         # Transcribe the audio
+        print(f"Starting transcription for file: {file.filename}")
         segments, info = model.transcribe(
             temp_file.name,
             language=language,
@@ -69,6 +70,7 @@ async def transcribe(
             temperature=temperature,
             beam_size=5,
         )
+        print("Transcription completed successfully")
         
         # Prepare the response
         text = ""
@@ -105,12 +107,14 @@ async def transcribe(
                 subtitle_content += f"{start_time} --> {end_time}\n"
                 subtitle_content += f"{segment['text']}\n\n"
             return subtitle_content
-            
     except Exception as e:
+        import traceback
+        traceback.print_exc()  # Print the full traceback
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         # Clean up the temporary file
         os.unlink(temp_file.name)
+        print(f"Deleted temporary file: {temp_file.name}")
 
 def format_timestamp(seconds, format_type):
     """Convert seconds to SRT or VTT timestamp format"""
