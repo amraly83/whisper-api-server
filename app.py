@@ -4,7 +4,6 @@ from faster_whisper import WhisperModel
 import tempfile
 import os
 import json
-import asyncio
 from typing import List, Dict, Optional, Any, Iterator
 from pydantic import BaseModel
 from config import settings
@@ -123,10 +122,9 @@ async def transcribe(
         
         # Transcribe the audio
         print(f"Starting transcription for file: {file.filename}")
-        
-        # Set up streaming params
-        beam_size = 5
-        
+        # Set up streaming params - use beam_size from settings
+        beam_size = settings.beam_size
+
         # If streaming is requested
         if stream:
             segments_iterator, info = whisper_model.transcribe(
