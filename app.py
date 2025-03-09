@@ -41,6 +41,7 @@ async def transcribe(
     response_format: str = Form(default="json"),
     temperature: float = Form(default=0),
 ):
+    model_param = model
     # Validate response format
     if response_format not in ["json", "text", "srt", "verbose_json", "vtt"]:
         raise HTTPException(status_code=400, detail="Unsupported response format")
