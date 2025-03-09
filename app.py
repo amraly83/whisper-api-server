@@ -56,7 +56,7 @@ async def transcribe(
         
         # Get file extension and check if it's supported
         file_ext = os.path.splitext(file.filename)[1].lower()
-        supported_formats = [".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm"]
+        supported_formats = [".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".oga"]
         
         if file_ext not in supported_formats:
             raise HTTPException(status_code=400, detail=f"Unsupported file format: {file_ext}")
