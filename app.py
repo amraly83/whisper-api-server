@@ -35,7 +35,7 @@ async def health():
 @app.post("/v1/audio/transcriptions")
 async def transcribe(
     file: UploadFile = File(...),
-    model_name: str = Form(default="whisper-1"),
+    model: str = Form(default="whisper-1"),
     language: str = Form(default=None),
     prompt: str = Form(default=None),
     response_format: str = Form(default="json"),
