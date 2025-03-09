@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     git \
     ffmpeg \
-    curl \  # Add curl for health checks
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy only requirements first to leverage Docker caching
