@@ -154,7 +154,7 @@ async def transcribe(
     if response_format not in ["sse_json", "text", "srt", "verbose_json", "vtt"]:
         raise HTTPException(status_code=400, detail="Unsupported response format")
 
-    try:
+try:
         # In-memory audio processing (no disk I/O)
     with timeit_context("Audio processing"):
     content = await file.read()
