@@ -1,15 +1,13 @@
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    whisper_model_size: str = Field(default="small", env="MODEL_SIZE")
-    compute_type: str = Field(default="int8", env="COMPUTE_TYPE")
-    device: str = Field(default="cpu", env="DEVICE")
-    beam_size: int = Field(default=3, env="BEAM_SIZE")
+    whisper_model_size: str = "small"
+    compute_type: str = "int8"
+    device: str = "cpu"
+    beam_size: int = 3
 
     model_config: SettingsConfigDict = SettingsConfigDict(
-        env_file=".env",          # Load variables from .env file
-        env_file_encoding="utf-8"
+        extra="ignore"  # Ignore unexpected environment variables
     )
 
 settings = Settings()
