@@ -100,11 +100,10 @@ def stream_generator(segments, info, response_format: str) -> Iterator[str]:
         yield json.dumps({"finished": True}) + "\n\n"
 
 def process_segment(segment, response_format: str) -> Optional[str]:
-    """Process a single transcript segment into the requested format"""
-    # Minimum text length to send (reduces small chunks)
-    min_length = 4 if response_format in ["text", "vtt", "srt"] else 1
+    min_length = 2  # Require at least 2 characters
+    text = (segment.text or "").strip()
     
-    if len(segment.text) < min_length:
+    if len(text) < min_length:
         return None
 
     return {
@@ -187,13 +186,14 @@ with timeit_context("Audio processing"):
         transcribe_params = dict(
             language=language,
             initial_prompt=prompt,
-            temperature=0 if stream else temperature,
-            beam_size=1 if stream else settings.beam_size,
+            temperature=temperature,  # Allow some temperature even when streaming
+            beam_size=min(settings.beam_size, 5),  # Cap beam size for performance
             vad_filter=True,
             vad_parameters=dict(
-                threshold=0.5,
-                min_silence_duration_ms=500
-            )
+                threshold=0.45,  # Lowered for better voice activation
+                min_silence_duration_ms=250  # Shorter silence gaps
+            ),
+            without_timestamps=True  # Faster transcriptions for live audio
         )
 
         # Run transcription in thread pool
@@ -207,6 +207,14 @@ with timeit_context("Audio processing"):
                 )
             )
             segments, info = await future
+
+        # Basic validation
+        if not segments:
+            logger.warning("No speech segments detected")
+            return {"text": ""}  # Handle empty response explicitly
+        
+        # Audio diagnostics
+        logger.info(f"Detected {len(segments)} segments. Language: {info.language}")
 
         # Streaming response
         if stream:
