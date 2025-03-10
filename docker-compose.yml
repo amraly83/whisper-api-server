@@ -12,12 +12,14 @@ services:
       - "8083:8083"
     environment:
       - API_KEY=${API_KEY}
-      - CORS_ORIGINS=*
       - MAX_DURATION=${MAX_DURATION:-600}
       - RATE_LIMIT=${RATE_LIMIT:-100}
       - REDIS_URL=redis://redis:6379/0
       - PYTHONUNBUFFERED=1
       - OMP_NUM_THREADS=1
+      - CORS_ORIGINS=["*"]
+      - CACHE_TTL=3600
+
     depends_on:
       - redis
     networks:
