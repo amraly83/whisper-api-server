@@ -1,7 +1,8 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    device: str = "cuda"
+    device: str = "cpu"
+    compute_type: str = "int8"
     whisper_model_size: str = "base"
     api_key: str
     max_duration: int = 600
