@@ -1,3 +1,4 @@
+import threading
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from faster_whisper import WhisperModel
@@ -7,8 +8,22 @@ import json
 from typing import List, Dict, Optional, Any, Iterator
 from pydantic import BaseModel
 from config import settings
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI(title="Whisper API Server")
+
+@app.on_event("startup")
+async def initialize_model():
+    # Warmup: Run a dummy transcription
+    print("Warming up model...")
+    try:
+        # Use a 1-second silent audio sample to initialize model weights
+        with open("silence_1s.wav", "rb") as f:
+            dummy_file = UploadFile(file=f, filename="silence.wav")
+            await transcribe(file=dummy_file)
+        print("Model warmup complete")
+    except Exception as e:
+        print(f"Warmup failed: {e}")
 
 # Fix the model initialization - the first parameter is positional, not named
 try:
