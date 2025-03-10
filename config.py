@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     compute_type: str = "int8"
     device: str = "cpu"
     beam_size: int = 2
+    max_workers: int = 4
 
     model_config: SettingsConfigDict = SettingsConfigDict(
         extra="ignore"  # Ignore unexpected environment variables
