@@ -2,7 +2,8 @@ version: '3.8'
 
 services:
   app:
-    build: . 
+    build: .
+    deploy:
       resources:
         limits:
           cpus: '2'
@@ -11,12 +12,12 @@ services:
       - "8083:8083"
     environment:
       - API_KEY=${API_KEY}
-      - CORS_ORIGINS=${CORS_ORIGINS}
-      - MAX_DURATION=${MAX_DURATION}
-      - RATE_LIMIT=${RATE_LIMIT}
-      - REDIS_URL=${REDIS_URL}
-      - PYTHONUNBUFFERED=${PYTHONUNBUFFERED}
-      - OMP_NUM_THREADS=${OMP_NUM_THREADS}
+      - CORS_ORIGINS=*
+      - MAX_DURATION=${MAX_DURATION:-600}
+      - RATE_LIMIT=${RATE_LIMIT:-100}
+      - REDIS_URL=redis://redis:6379/0
+      - PYTHONUNBUFFERED=1
+      - OMP_NUM_THREADS=1
     depends_on:
       - redis
     networks:
