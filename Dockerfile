@@ -5,6 +5,7 @@ WORKDIR /app
 # Install system dependencies including ffmpeg and curl
 RUN apt-get update && apt-get install -y \
     build-essential \
+    libsndfile1 \
     git \
     ffmpeg \
     wget \
