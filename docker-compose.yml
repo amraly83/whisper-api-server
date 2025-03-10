@@ -6,9 +6,13 @@ services:
     ports:
       - "8083:8083"
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - PYTHONUNBUFFERED=1
-      - OMP_NUM_THREADS=1
+      - API_KEY=${API_KEY}
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - MAX_DURATION=${MAX_DURATION}
+      - RATE_LIMIT=${RATE_LIMIT}
+      - REDIS_URL=${REDIS_URL}
+      - PYTHONUNBUFFERED=${PYTHONUNBUFFERED}
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS}
     depends_on:
       - redis
     networks:
