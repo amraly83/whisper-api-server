@@ -156,47 +156,48 @@ async def transcribe(
         raise HTTPException(status_code=400, detail="Unsupported response format")
 
     try:
-    # In-memory audio processing (no disk I/O)
-    with timeit_context("Audio processing"):
-        # Read and convert audio to proper format
-        content = await file.read()
-        
-        # Use soundfile to handle various audio formats
-        with BytesIO(content) as audio_buffer:
-            audio_data, sample_rate = sf.read(
-                audio_buffer,
-                dtype='float32',
-                always_2d=True
-            )
+        # ======================== FIXED INDENTATION ========================
+        # In-memory audio processing (no disk I/O)
+        with timeit_context("Audio processing"):
+            # Read and convert audio to proper format
+            content = await file.read()
             
-            # Convert to mono if needed
-            if audio_data.ndim > 1:
-                audio_data = np.mean(audio_data, axis=1)
+            # Use soundfile to handle various audio formats
+            with BytesIO(content) as audio_buffer:
+                audio_data, sample_rate = sf.read(
+                    audio_buffer,
+                    dtype='float32',
+                    always_2d=True
+                )
+                
+                # Convert to mono if needed
+                if audio_data.ndim > 1:
+                    audio_data = np.mean(audio_data, axis=1)
 
-    # Configure transcription parameters
-    transcribe_params = dict(
-        language=language,
-        initial_prompt=prompt,
-        temperature=0 if stream else temperature,
-        beam_size=1 if stream else settings.beam_size,
-        vad_filter=True,
-        vad_parameters=dict(
-            threshold=0.5,
-            min_silence_duration_ms=500
-        )
-    )
-
-    # Run transcription in thread pool
-    with timeit_context("Transcription"):
-        loop = asyncio.get_event_loop()
-        future = loop.run_in_executor(
-            executor,
-            lambda: whisper_model.transcribe(
-                audio=audio_data,  # Directly pass numpy array
-                **transcribe_params
+        # Configure transcription parameters
+        transcribe_params = dict(
+            language=language,
+            initial_prompt=prompt,
+            temperature=0 if stream else temperature,
+            beam_size=1 if stream else settings.beam_size,
+            vad_filter=True,
+            vad_parameters=dict(
+                threshold=0.5,
+                min_silence_duration_ms=500
             )
         )
-        segments, info = await future
+
+        # Run transcription in thread pool
+        with timeit_context("Transcription"):
+            loop = asyncio.get_event_loop()
+            future = loop.run_in_executor(
+                executor,
+                lambda: whisper_model.transcribe(
+                    audio=audio_data,  # Directly pass numpy array
+                    **transcribe_params
+                )
+            )
+            segments, info = await future
 
         # Streaming response
         if stream:
@@ -207,11 +208,12 @@ async def transcribe(
 
         # Non-streaming response
         return format_non_streaming_response(segments, info, response_format)
+        # ======================== END FIXED SECTION ========================
 
     except Exception as e:
         logger.error(f"Transcription failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
+        
 def format_non_streaming_response(segments, info, response_format: str):
     """Format complete transcript response"""
     text = "".join(seg.text for seg in segments)
