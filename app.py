@@ -156,7 +156,7 @@ async def transcribe(
 
     try:
         # In-memory audio processing (no disk I/O)
-with timeit_context("Audio processing"):
+    with timeit_context("Audio processing"):
     content = await file.read()
     
     try:
