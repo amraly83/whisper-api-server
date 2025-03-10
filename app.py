@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Whisper API Server")
-app.add_middleware(GZipMiddleware, minimum_size=1000)  # Compress responses >1KB
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Thread pool for CPU-bound tasks
 executor = ThreadPoolExecutor(max_workers=settings.max_workers)
@@ -49,13 +49,12 @@ async def initialize_model():
                 settings.whisper_model_size,
                 device=settings.device,
                 compute_type=settings.compute_type,
-                download_root="/models",  # Cache models to avoid redownloads
+                download_root="/models",
             )
 
-        # Model warmup (critical for CUDA but useful for CPU too)
         logger.info("Warming up model...")
         with timeit_context("Model warmup"):
-            dummy_audio = np.zeros((16000,), dtype=np.float32)  # 1s of silence
+            dummy_audio = np.zeros((16000,), dtype=np.float32)
             list(whisper_model.transcribe(
                 audio=dummy_audio,
                 beam_size=1,
@@ -95,7 +94,6 @@ def stream_generator(segments, info, response_format: str) -> Iterator[str]:
         if chunk:
             yield chunk
             
-    # Finalization for JSON formats
     if response_format in ["sse_json", "verbose_json"]:
         yield json.dumps({"finished": True}) + "\n\n"
 
@@ -106,26 +104,34 @@ def process_segment(segment, response_format: str) -> Optional[str]:
     if len(text) < min_length:
         return None
 
-    return {
-        "sse_json": lambda: f"data: {json.dumps({'text': segment.text})}\n\n",
-        "verbose_json": lambda: f"""data: {json.dumps({
-            'text': segment.text,
-            'start': segment.start,
-            'end': segment.end,
-            'confidence': segment.avg_logprobt
-        })}\n\n""",
-        "text": lambda: f"{segment.text} ",
-        "srt": lambda: format_subtitle(segment, "srt"),
-        "vtt": lambda: format_subtitle(segment, "vtt")
-    }.get(response_format, lambda: None)()
+    try:
+        return {
+            "sse_json": lambda: f"data: {json.dumps({'text': text})}\n\n",
+            "verbose_json": lambda: f"data: {json.dumps({
+                'text': text,
+                'start': segment.start,
+                'end': segment.end,
+                'confidence': round(segment.avg_logprob, 2)
+            })}\n\n",
+            "text": lambda: f"{text} ",
+            "srt": lambda: format_subtitle(segment, "srt"),
+            "vtt": lambda: format_subtitle(segment, "vtt")
+        }.get(response_format, lambda: None)()
+    except Exception as e:
+        logger.error(f"Error formatting segment: {str(e)}")
+        return None
 
 def format_subtitle(segment, format_type: str) -> str:
     """Format subtitle content with proper timestamps"""
-    return (
-        f"{format_timestamp(segment.start, format_type)} --> "
-        f"{format_timestamp(segment.end, format_type)}\n"
-        f"{segments.text}\n\n"
-    )
+    try:
+        return (
+            f"{format_timestamp(segment.start, format_type)} --> "
+            f"{format_timestamp(segment.end, format_type)}\n"
+            f"{segment.text.strip()}\n\n"
+        )
+    except Exception as e:
+        logger.error(f"Subtitle formatting failed: {str(e)}")
+        return ""
 
 def format_timestamp(seconds: float, format_type: str) -> str:
     """Optimized timestamp formatting"""
@@ -150,106 +156,99 @@ async def transcribe(
     stream: bool = Form(default=False),
 ):
     """Optimized transcription endpoint supporting streaming"""
-    # Validate inputs
     if response_format not in ["sse_json", "text", "srt", "verbose_json", "vtt"]:
         raise HTTPException(status_code=400, detail="Unsupported response format")
 
-try:
-        # In-memory audio processing (no disk I/O)
-    with timeit_context("Audio processing"):
-    content = await file.read()
-    
     try:
-        # Use soundfile with proper error handling
-        with BytesIO(content) as audio_buffer:
-            audio_data, sample_rate = sf.read(
-                audio_buffer,
-                dtype='float32',
-                always_2d=True,
-                fill_value=0.0  # Handle truncated files
-            )
-    except sf.LibsndfileError as e:
-        logger.error(f"Invalid audio file: {str(e)}")
-        raise HTTPException(status_code=400, detail="Invalid audio file format")
-        
-    # Convert to mono and validate content
-    if audio_data.size == 0:
-        raise HTTPException(status_code=400, detail="Empty audio file")
-        
-    if audio_data.ndim > 1:
-        audio_data = np.mean(audio_data, axis=1)
-    
-    # Debug: Verify audio content
-    logger.info(f"Audio loaded: {audio_data.shape} samples, {np.max(audio_data):.2f} max amplitude")
+        # --- Audio Processing ---
+        with timeit_context("Audio processing"):
+            content = await file.read()
+            
+            try:
+                with BytesIO(content) as audio_buffer:
+                    audio_data, sample_rate = sf.read(
+                        audio_buffer,
+                        dtype='float32',
+                        always_2d=True,
+                        fill_value=0.0
+                    )
+            except sf.LibsndfileError as e:
+                logger.error(f"Invalid audio file: {str(e)}")
+                raise HTTPException(status_code=400, detail="Invalid audio file format")
+                
+            if audio_data.size == 0:
+                raise HTTPException(status_code=400, detail="Empty audio file")
+                
+            if audio_data.ndim > 1:
+                audio_data = np.mean(audio_data, axis=1)
 
-        # Configure transcription parameters
+        # --- Transcription Parameters ---
         transcribe_params = dict(
             language=language,
             initial_prompt=prompt,
-            temperature=temperature,  # Allow some temperature even when streaming
-            beam_size=min(settings.beam_size, 5),  # Cap beam size for performance
+            temperature=temperature,
+            beam_size=min(settings.beam_size, 5),
             vad_filter=True,
             vad_parameters=dict(
-                threshold=0.45,  # Lowered for better voice activation
-                min_silence_duration_ms=250  # Shorter silence gaps
+                threshold=0.45,
+                min_silence_duration_ms=250
             ),
-            without_timestamps=True  # Faster transcriptions for live audio
+            without_timestamps=True
         )
 
-        # Run transcription in thread pool
+        # --- Run Transcription ---
         with timeit_context("Transcription"):
             loop = asyncio.get_event_loop()
             future = loop.run_in_executor(
                 executor,
                 lambda: whisper_model.transcribe(
-                    audio=audio_data,  # Directly pass numpy array
+                    audio=audio_data,
                     **transcribe_params
                 )
             )
             segments, info = await future
 
-        # Basic validation
         if not segments:
             logger.warning("No speech segments detected")
-            return {"text": ""}  # Handle empty response explicitly
-        
-        # Audio diagnostics
+            return {"text": ""}
+
         logger.info(f"Detected {len(segments)} segments. Language: {info.language}")
 
-        # Streaming response
+        # --- Response Handling ---
         if stream:
             return StreamingResponse(
                 stream_generator(segments, info, response_format),
                 media_type="text/event-stream" if "json" in response_format else "text/plain"
             )
 
-        # Non-streaming response
         return format_non_streaming_response(segments, info, response_format)
 
+    except HTTPException as he:
+        raise
     except Exception as e:
-        logger.error(f"Transcription failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Transcription failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
         
 def format_non_streaming_response(segments, info, response_format: str):
-    """Format complete transcript response"""
     text = "".join(seg.text for seg in segments)
     
     if response_format == "text":
         return text
-    elif response_format == "sse_json":
+    if response_format == "sse_json":
         return {"text": text}
-    elif response_format == "verbose_json":
+    if response_format == "verbose_json":
         return {
             "text": text,
             "segments": [{
                 "start": seg.start,
                 "end": seg.end,
                 "text": seg.text,
-                "confidence": seg.avg_logprob
+                "confidence": round(seg.avg_logprob, 2)
             } for seg in segments],
             "language": info.language
         }
-    # Handle SRT/VTT formats similarly...
+    # Handle subtitle formats
+    return "".join(format_subtitle(seg, "srt" if response_format == "srt" else "vtt") for seg in segments)
 
 # --- Health Checks ---
 @app.get("/")
@@ -258,7 +257,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "workers": executor._max_workers}
+    return {"status": "healthy"}
 
 # --- Main Execution ---
 if __name__ == "__main__":
@@ -268,5 +267,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8083,
         server_header=False,
-        timeout_keep_alive=60  # Allow HTTP keep-alives
+        timeout_keep_alive=60
     )
