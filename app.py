@@ -1,6 +1,8 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, status, Depends
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from faster_whisper import WhisperModel
 from io import BytesIO
 import numpy as np
@@ -9,263 +11,222 @@ import asyncio
 import os
 import json
 import logging
+import hashlib
+import redis
 from typing import List, Dict, Optional, Any, Iterator
 from pydantic import BaseModel
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from time import time
+from cachetools import TTLCache
 from config import settings
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Whisper API Server")
+# Initialize Redis for rate limiting
+redis_client = redis.StrictRedis.from_url(settings.redis_url)
+
+# Setup application
+app = FastAPI(title="Whisper API Server", docs_url=None, redoc_url=None)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# Thread pool for CPU-bound tasks
-executor = ThreadPoolExecutor(max_workers=settings.max_workers)
+# CORS Configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Global model instance
+# Security
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+# Caching and Rate Limiting
+response_cache = TTLCache(maxsize=1000, ttl=settings.cache_ttl)
+rate_limit_cache = TTLCache(maxsize=10000, ttl=60)
+
+# Thread pool and model initialization
+executor = ThreadPoolExecutor(max_workers=settings.max_workers)
 whisper_model: Optional[WhisperModel] = None
 
-# --- Performance Monitoring ---
-@contextmanager
-def timeit_context(name):
-    start_time = time()
-    yield
-    elapsed = (time() - start_time) * 1000
-    logger.info(f"{name} took {elapsed:.2f}ms")
-
-# --- Model Management ---
-@app.on_event("startup")
-async def initialize_model():
-    """Initialize and warm up the ASR model"""
-    global whisper_model
-    try:
-        logger.info("Loading Whisper model...")
-        with timeit_context("Model loading"):
-            whisper_model = WhisperModel(
-                settings.whisper_model_size,
-                device=settings.device,
-                compute_type=settings.compute_type,
-                download_root="/models",
+# --- Middlewares ---
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    # Request validation
+    if request.method != "GET" and request.url.path == "/v1/audio/transcriptions":
+        content_type = request.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            return JSONResponse(
+                content={"detail": "Unsupported media type"},
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE
             )
 
-        logger.info("Warming up model...")
-        with timeit_context("Model warmup"):
-            dummy_audio = np.zeros((16000,), dtype=np.float32)
-            list(whisper_model.transcribe(
-                audio=dummy_audio,
-                beam_size=1,
-                vad_filter=True,
-                vad_parameters=dict(
-                    threshold=0.5,
-                    min_silence_duration_ms=500
-                )
-            ))
+    # Rate limiting
+    client_ip = request.headers.get("X-Forwarded-For", request.client.host)
+    rate_key = f"rate_limit:{client_ip}"
+    
+    current_count = redis_client.incr(rate_key)
+    if current_count > settings.rate_limit:
+        return JSONResponse(
+            content={"detail": "Rate limit exceeded"},
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS
+        )
+    if current_count == 1:
+        redis_client.expire(rate_key, 60)
         
-        logger.info("Model ready")
+    return await call_next(request)
+
+# --- Security Dependencies ---
+async def validate_api_key(api_key: str = Depends(api_key_header)):
+    if not api_key or api_key != settings.api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key"
+        )
+    return True
+
+# --- Model Initialization ---
+@app.on_event("startup")
+async def initialize_model():
+    global whisper_model
+    try:
+        logger.info("Initializing Whisper model...")
+        whisper_model = WhisperModel(
+            settings.whisper_model_size,
+            device=settings.device,
+            compute_type=settings.compute_type,
+            download_root="/models"
+        )
+        # Warmup model
+        dummy_audio = np.zeros((16000,), dtype=np.float32)
+        list(whisper_model.transcribe(dummy_audio))
+        logger.info("Model initialized successfully")
     except Exception as e:
-        logger.error(f"Model initialization failed: {e}")
+        logger.error(f"Model initialization failed: {str(e)}")
         raise
 
-# --- Middleware ---
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    """Log request processing times"""
-    start_time = time()
-    response = await call_next(request)
-    process_time = (time() - start_time) * 1000
-    logger.info(f"{request.method} {request.url.path} - {response.status_code} ({process_time:.2f}ms)")
-    return response
+# --- Audio Validation ---
+def validate_audio(input_data: bytes) -> np.ndarray:
+    try:
+        data, sr = sf.read(BytesIO(input_data), dtype='float32')
+        if data.size == 0:
+            raise ValueError("Audio file is empty")
+        return np.mean(data, axis=1) if data.ndim > 1 else data
+    except Exception as e:
+        logger.error(f"Audio validation failed: {str(e)}")
+        raise HTTPException(status_code=400, detail="Invalid audio file")
 
-# --- Data Models ---
+# --- Core Operations ---
 class TranscriptionResponse(BaseModel):
     text: str
+    duration: float
+    language: str
     segments: Optional[List[Dict[str, Any]]] = None
-    language: Optional[str] = None
 
-# --- Core Business Logic ---
-def stream_generator(segments, info, response_format: str) -> Iterator[str]:
-    """Generate streaming responses with optimized time-to-first-byte"""
-    for segment in segments:
-        chunk = process_segment(segment, response_format)
-        if chunk:
-            yield chunk
-            
-    if response_format in ["sse_json", "verbose_json"]:
-        yield json.dumps({"finished": True}) + "\n\n"
+def generate_cache_key(content: bytes, params: dict) -> str:
+    return hashlib.sha256(content + json.dumps(params).encode()).hexdigest()
 
-def process_segment(segment, response_format: str) -> Optional[str]:
-    min_length = 2  # Require at least 2 characters
-    text = (segment.text or "").strip()
-    
-    if len(text) < min_length:
-        return None
-
-    try:
-        return {
-            "sse_json": lambda: f"data: {json.dumps({'text': text})}\n\n",
-            "verbose_json": lambda: f"data: {json.dumps({
-                'text': text,
-                'start': segment.start,
-                'end': segment.end,
-                'confidence': round(segment.avg_logprob, 2)
-            })}\n\n",
-            "text": lambda: f"{text} ",
-            "srt": lambda: format_subtitle(segment, "srt"),
-            "vtt": lambda: format_subtitle(segment, "vtt")
-        }.get(response_format, lambda: None)()
-    except Exception as e:
-        logger.error(f"Error formatting segment: {str(e)}")
-        return None
-
-def format_subtitle(segment, format_type: str) -> str:
-    """Format subtitle content with proper timestamps"""
-    try:
-        return (
-            f"{format_timestamp(segment.start, format_type)} --> "
-            f"{format_timestamp(segment.end, format_type)}\n"
-            f"{segment.text.strip()}\n\n"
-        )
-    except Exception as e:
-        logger.error(f"Subtitle formatting failed: {str(e)}")
-        return ""
-
-def format_timestamp(seconds: float, format_type: str) -> str:
-    """Optimized timestamp formatting"""
-    ms = int((seconds - int(seconds)) * 1000)
-    hours, rem = divmod(int(seconds), 3600)
-    minutes, seconds = divmod(rem, 60)
-    
-    return {
-        "srt": f"{hours:02}:{minutes:02}:{seconds:02},{ms:03}",
-        "vtt": f"{hours:02}:{minutes:02}:{seconds:02}.{ms:03}"
-    }[format_type]
-
-# --- API Endpoints ---
-@app.post("/v1/audio/transcriptions")
-async def transcribe(
+@app.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
+async def transcribe_audio(
     file: UploadFile = File(...),
-    model: str = Form(default="whisper-1"),
-    language: str = Form(default=None),
-    prompt: str = Form(default=None),
-    response_format: str = Form(default="sse_json"),
-    temperature: float = Form(default=0),
-    stream: bool = Form(default=False),
+    language: str = Form(None),
+    prompt: str = Form(None),
+    response_format: str = Form("json"),
+    temperature: float = Form(0.0),
+    _: bool = Depends(validate_api_key)
 ):
-    """Optimized transcription endpoint supporting streaming"""
-    if response_format not in ["sse_json", "text", "srt", "verbose_json", "vtt"]:
-        raise HTTPException(status_code=400, detail="Unsupported response format")
+    # Input validation
+    if response_format not in {"json", "text", "verbose_json"}:
+        raise HTTPException(400, "Unsupported response format")
 
     try:
-        # --- Audio Processing ---
-        with timeit_context("Audio processing"):
-            content = await file.read()
-            
-            try:
-                with BytesIO(content) as audio_buffer:
-                    audio_data, sample_rate = sf.read(
-                        audio_buffer,
-                        dtype='float32',
-                        always_2d=True,
-                        fill_value=0.0
-                    )
-            except sf.LibsndfileError as e:
-                logger.error(f"Invalid audio file: {str(e)}")
-                raise HTTPException(status_code=400, detail="Invalid audio file format")
-                
-            if audio_data.size == 0:
-                raise HTTPException(status_code=400, detail="Empty audio file")
-                
-            if audio_data.ndim > 1:
-                audio_data = np.mean(audio_data, axis=1)
+        content = await file.read()
+        params = {
+            "language": language,
+            "prompt": prompt,
+            "temperature": temperature,
+            "format": response_format
+        }
+        cache_key = generate_cache_key(content, params)
+        
+        # Check cache
+        if cache_key in response_cache:
+            logger.info(f"Cache hit for {cache_key[:8]}")
+            return response_cache[cache_key]
 
-        # --- Transcription Parameters ---
-        transcribe_params = dict(
-            language=language,
-            initial_prompt=prompt,
-            temperature=temperature,
-            beam_size=min(settings.beam_size, 5),
-            vad_filter=True,
-            vad_parameters=dict(
-                threshold=0.45,
-                min_silence_duration_ms=250
-            ),
-            without_timestamps=True
-        )
+        # Process audio
+        with timeit_context("audio_processing"):
+            audio_data = validate_audio(content)
+            duration = len(audio_data) / 16000  # Assumes 16kHz sample rate
+            if duration > settings.max_duration:
+                raise HTTPException(400, f"Audio exceeds {settings.max_duration}s limit")
 
-        # --- Run Transcription ---
-        with timeit_context("Transcription"):
+        # Transcribe
+        with timeit_context("transcription"):
             loop = asyncio.get_event_loop()
-            future = loop.run_in_executor(
+            segments, info = await loop.run_in_executor(
                 executor,
                 lambda: whisper_model.transcribe(
                     audio=audio_data,
-                    **transcribe_params
+                    language=language,
+                    initial_prompt=prompt,
+                    temperature=temperature,
+                    vad_parameters={"threshold": 0.45, "min_silence_duration_ms": 250}
                 )
             )
-            segments, info = await future
 
-        if not segments:
-            logger.warning("No speech segments detected")
-            return {"text": ""}
-
-        logger.info(f"Detected {len(segments)} segments. Language: {info.language}")
-
-        # --- Response Handling ---
-        if stream:
-            return StreamingResponse(
-                stream_generator(segments, info, response_format),
-                media_type="text/event-stream" if "json" in response_format else "text/plain"
-            )
-
-        return format_non_streaming_response(segments, info, response_format)
-
-    except HTTPException as he:
-        raise
-    except Exception as e:
-        logger.error(f"Transcription failed: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+        # Format response
+        response = {
+            "text": "".join(seg.text for seg in segments),
+            "duration": duration,
+            "language": info.language
+        }
         
-def format_non_streaming_response(segments, info, response_format: str):
-    text = "".join(seg.text for seg in segments)
-    
-    if response_format == "text":
-        return text
-    if response_format == "sse_json":
-        return {"text": text}
-    if response_format == "verbose_json":
-        return {
-            "text": text,
-            "segments": [{
+        if response_format == "verbose_json":
+            response["segments"] = [{
                 "start": seg.start,
                 "end": seg.end,
                 "text": seg.text,
                 "confidence": round(seg.avg_logprob, 2)
-            } for seg in segments],
-            "language": info.language
-        }
-    # Handle subtitle formats
-    return "".join(format_subtitle(seg, "srt" if response_format == "srt" else "vtt") for seg in segments)
+            } for seg in segments]
 
-# --- Health Checks ---
-@app.get("/")
+        # Cache result
+        response_cache[cache_key] = response
+        return response
+
+    except HTTPException as he:
+        raise
+    except Exception as e:
+        logger.error(f"Transcription error: {str(e)}")
+        raise HTTPException(500, "Processing failed") from e
+
+# --- Health Endpoints ---
+@app.get("/health", include_in_schema=False)
+async def health_check():
+    return {"status": "ok", "workers": executor._max_workers}
+
+@app.get("/", include_in_schema=False)
 async def root():
-    return {"status": "running", "model": settings.whisper_model_size}
+    return {"name": "Whisper API", "status": "running"}
 
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
+# --- Utility Functions ---
+@contextmanager
+def timeit_context(name: str):
+    start = time()
+    try:
+        yield
+    finally:
+        elapsed = (time() - start) * 1000
+        logger.info(f"{name}: {elapsed:.2f}ms")
 
-# --- Main Execution ---
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8083,
-        server_header=False,
-        timeout_keep_alive=60
+        port=int(os.getenv("PORT", "8083")),
+        log_config=None
     )
