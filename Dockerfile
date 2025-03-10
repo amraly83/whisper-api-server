@@ -17,7 +17,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy ENV file **before** the rest of the app
-COPY .env .         # Explicitly copy .env
 COPY . .            # Copy everything else
 
 EXPOSE 8083
