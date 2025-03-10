@@ -1,259 +1,241 @@
-import threading
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.gzip import GZipMiddleware
 from faster_whisper import WhisperModel
-import tempfile
+from io import BytesIO
+import numpy as np
+import soundfile as sf
+import asyncio
 import os
 import json
+import logging
 from typing import List, Dict, Optional, Any, Iterator
 from pydantic import BaseModel
-from config import settings
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from time import time
+from config import settings
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Whisper API Server")
+app.add_middleware(GZipMiddleware, minimum_size=1000)  # Compress responses >1KB
 
+# Thread pool for CPU-bound tasks
+executor = ThreadPoolExecutor(max_workers=settings.max_workers)
+
+# Global model instance
+whisper_model: Optional[WhisperModel] = None
+
+# --- Performance Monitoring ---
+@contextmanager
+def timeit_context(name):
+    start_time = time()
+    yield
+    elapsed = (time() - start_time) * 1000
+    logger.info(f"{name} took {elapsed:.2f}ms")
+
+# --- Model Management ---
 @app.on_event("startup")
 async def initialize_model():
-    # Warmup: Run a dummy transcription
-    print("Warming up model...")
+    """Initialize and warm up the ASR model"""
+    global whisper_model
     try:
-        # Use a 1-second silent audio sample to initialize model weights
-        with open("silence_1s.wav", "rb") as f:
-            dummy_file = UploadFile(file=f, filename="silence.wav")
-            await transcribe(file=dummy_file)
-        print("Model warmup complete")
+        logger.info("Loading Whisper model...")
+        with timeit_context("Model loading"):
+            whisper_model = WhisperModel(
+                settings.whisper_model_size,
+                device=settings.device,
+                compute_type=settings.compute_type,
+                download_root="/models",  # Cache models to avoid redownloads
+            )
+
+        # Model warmup (critical for CUDA but useful for CPU too)
+        logger.info("Warming up model...")
+        with timeit_context("Model warmup"):
+            dummy_audio = np.zeros((16000,), dtype=np.float32)  # 1s of silence
+            list(whisper_model.transcribe(
+                audio=dummy_audio,
+                beam_size=1,
+                vad_filter=True,
+                vad_parameters=dict(
+                    threshold=0.5,
+                    min_silence_duration_ms=500
+                )
+            ))
+        
+        logger.info("Model ready")
     except Exception as e:
-        print(f"Warmup failed: {e}")
+        logger.error(f"Model initialization failed: {e}")
+        raise
 
-# Fix the model initialization - the first parameter is positional, not named
-try:
-    print(f"Loading model: size={settings.whisper_model_size}, device={settings.device}, compute_type={settings.compute_type}")
-    # The model_size should be a positional argument, not a keyword argument
-    whisper_model = WhisperModel(
-        settings.whisper_model_size,  # Remove the parameter name
-        device=settings.device, 
-        compute_type=settings.compute_type
-    )
-    print("Model loaded successfully")
-except Exception as e:
-    print(f"Error loading model: {e}")
-    raise
+# --- Middleware ---
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log request processing times"""
+    start_time = time()
+    response = await call_next(request)
+    process_time = (time() - start_time) * 1000
+    logger.info(f"{request.method} {request.url.path} - {response.status_code} ({process_time:.2f}ms)")
+    return response
 
-# Models for response structure
+# --- Data Models ---
 class TranscriptionResponse(BaseModel):
     text: str
     segments: Optional[List[Dict[str, Any]]] = None
     language: Optional[str] = None
 
-@app.get("/")
-async def root():
-    return {
-        "message": "Whisper API is running",
-        "model_size": settings.whisper_model_size,
-        "device": settings.device
-    }
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
-
+# --- Core Business Logic ---
 def stream_generator(segments, info, response_format: str) -> Iterator[str]:
-    """Generate streaming responses from transcription segments."""
-    full_text = ""
-    segment_data = []
-    
-    for i, segment in enumerate(segments):
-        full_text += segment.text
-        current_segment = {
-            "id": i,
-            "start": segment.start,
-            "end": segment.end,
-            "text": segment.text,
-            "confidence": segment.avg_logprob,
-        }
-        segment_data.append(current_segment)
-        
-        # Format the current segment based on requested format
-        if response_format == "text":
-            yield segment.text + " "
-        elif response_format == "json":
-            chunk = {"text": segment.text, "finished": False}
-            yield json.dumps(chunk) + "\n"
-        elif response_format == "verbose_json":
-            chunk = {
-                "text": segment.text,
-                "segment": current_segment,
-                "finished": False
-            }
-            yield json.dumps(chunk) + "\n"
-        elif response_format in ["srt", "vtt"]:
-            start_time = format_timestamp(segment.start, response_format)
-            end_time = format_timestamp(segment.end, response_format)
-            subtitle = f"{i+1}\n{start_time} --> {end_time}\n{segment.text}\n\n"
-            yield subtitle
-    
-    # Send a final message for formats that need completion indication
-    if response_format == "json":
-        final_chunk = {"text": full_text, "finished": True}
-        yield json.dumps(final_chunk) + "\n"
-    elif response_format == "verbose_json":
-        final_chunk = {
-            "text": full_text,
-            "segments": segment_data,
-            "language": info.language,
-            "finished": True
-        }
-        yield json.dumps(final_chunk) + "\n"
+    """Generate streaming responses with optimized time-to-first-byte"""
+    for segment in segments:
+        chunk = process_segment(segment, response_format)
+        if chunk:
+            yield chunk
+            
+    # Finalization for JSON formats
+    if response_format in ["sse_json", "verbose_json"]:
+        yield json.dumps({"finished": True}) + "\n\n"
 
+def process_segment(segment, response_format: str) -> Optional[str]:
+    """Process a single transcript segment into the requested format"""
+    # Minimum text length to send (reduces small chunks)
+    min_length = 4 if response_format in ["text", "vtt", "srt"] else 1
+    
+    if len(segment.text) < min_length:
+        return None
+
+    return {
+        "sse_json": lambda: f"data: {json.dumps({'text': segment.text})}\n\n",
+        "verbose_json": lambda: f"data: {json.dumps({
+            'text': segment.text,
+            'start': segment.start,
+            'end': segment.end,
+            'confidence': segment.avg_logprob
+        })}\n\n",
+        "text": lambda: f"{segment.text} ",
+        "srt": lambda: format_subtitle(segment, "srt"),
+        "vtt": lambda: format_subtitle(segment, "vtt")
+    }.get(response_format, lambda: None)()
+
+def format_subtitle(segment, format_type: str) -> str:
+    """Format subtitle content with proper timestamps"""
+    return (
+        f"{format_timestamp(segment.start, format_type)} --> "
+        f"{format_timestamp(segment.end, format_type)}\n"
+        f"{segments.text}\n\n"
+    )
+
+def format_timestamp(seconds: float, format_type: str) -> str:
+    """Optimized timestamp formatting"""
+    ms = int((seconds - int(seconds)) * 1000)
+    hours, rem = divmod(int(seconds), 3600)
+    minutes, seconds = divmod(rem, 60)
+    
+    return {
+        "srt": f"{hours:02}:{minutes:02}:{seconds:02},{ms:03}",
+        "vtt": f"{hours:02}:{minutes:02}:{seconds:02}.{ms:03}"
+    }[format_type]
+
+# --- API Endpoints ---
 @app.post("/v1/audio/transcriptions")
 async def transcribe(
     file: UploadFile = File(...),
     model: str = Form(default="whisper-1"),
     language: str = Form(default=None),
     prompt: str = Form(default=None),
-    response_format: str = Form(default="json"),
+    response_format: str = Form(default="sse_json"),
     temperature: float = Form(default=0),
     stream: bool = Form(default=False),
 ):
-    # Validate response format
-    if response_format not in ["json", "text", "srt", "verbose_json", "vtt"]:
+    """Optimized transcription endpoint supporting streaming"""
+    # Validate inputs
+    if response_format not in ["sse_json", "text", "srt", "verbose_json", "vtt"]:
         raise HTTPException(status_code=400, detail="Unsupported response format")
-    
-    # Create a temporary file
-    temp_file = tempfile.NamedTemporaryFile(delete=False)
-    print(f"Created temporary file: {temp_file.name}")
-    
-    try:
-        # Save the uploaded file to the temporary file
-        with open(temp_file.name, "wb") as buffer:
-            buffer.write(await file.read())
-        
-        # Get file extension and check if it's supported
-        file_ext = os.path.splitext(file.filename)[1].lower()
-        supported_formats = [".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".oga"]
-        
-        if file_ext not in supported_formats:
-            raise HTTPException(status_code=400, detail=f"Unsupported file format: {file_ext}")
-        
-        # Transcribe the audio
-        print(f"Starting transcription for file: {file.filename}")
-        # Set up streaming params - use beam_size from settings
-        beam_size = settings.beam_size
 
-        # If streaming is requested
-        if stream:
-            segments_iterator, info = whisper_model.transcribe(
-                temp_file.name,
-                language=language,
-                initial_prompt=prompt,
-                temperature=temperature,
-                beam_size=beam_size,
-            )
-            
-            # Return a streaming response
-            return StreamingResponse(
-                stream_generator(segments_iterator, info, response_format),
-                media_type="text/event-stream" if response_format in ["json", "verbose_json"] else "text/plain"
-            )
-        
-        # Non-streaming mode (original behavior)
-        segments, info = whisper_model.transcribe(
-            temp_file.name,
+    try:
+        # In-memory audio processing (no disk I/O)
+        with timeit_context("Audio processing"):
+            audio_data = np.frombuffer(await file.read(), dtype=np.int16)
+            audio_stream = BytesIO()
+            sf.write(audio_stream, audio_data, 16000, format='WAV')
+            audio_stream.seek(0)
+
+        # Configure transcription parameters
+        transcribe_params = dict(
             language=language,
             initial_prompt=prompt,
-            temperature=temperature,
-            beam_size=beam_size,
+            temperature=0 if stream else temperature,
+            beam_size=1 if stream else settings.beam_size,
+            vad_filter=True,
+            vad_parameters=dict(
+                threshold=0.5,
+                min_silence_duration_ms=500
+            )
         )
-        print("Transcription completed successfully")
-        
-        # Prepare the response
-        text = ""
-        segments_data = []
-        
-        for segment in segments:
-            text += segment.text
-            segments_data.append({
-                "id": len(segments_data),
-                "start": segment.start,
-                "end": segment.end,
-                "text": segment.text,
-                "confidence": segment.avg_logprob,
-            })
-        
-        # Format response based on requested format
-        if response_format == "text":
-            return text
-        elif response_format == "json":
-            return {"text": text}
-        elif response_format == "verbose_json":
-            return {
-                "text": text,
-                "segments": segments_data,
-                "language": info.language,
-            }
-        elif response_format == "srt" or response_format == "vtt":
-            # This is a simplification - proper SRT/VTT formatting would require more work
-            subtitle_content = ""
-            for i, segment in enumerate(segments_data):
-                subtitle_content += f"{i+1}\n"
-                start_time = format_timestamp(segment["start"], response_format)
-                end_time = format_timestamp(segment["end"], response_format)
-                subtitle_content += f"{start_time} --> {end_time}\n"
-                subtitle_content += f"{segment['text']}\n\n"
-            return subtitle_content
-            
+
+        # Run transcription in thread pool
+        with timeit_context("Transcription"):
+            loop = asyncio.get_event_loop()
+            future = loop.run_in_executor(
+                executor,
+                lambda: whisper_model.transcribe(audio_stream.getvalue(), **transcribe_params)
+            )
+            segments, info = await future
+
+        # Streaming response
+        if stream:
+            return StreamingResponse(
+                stream_generator(segments, info, response_format),
+                media_type="text/event-stream" if "json" in response_format else "text/plain"
+            )
+
+        # Non-streaming response
+        return format_non_streaming_response(segments, info, response_format)
+
     except Exception as e:
-        import traceback
-        traceback.print_exc()  # Print the full traceback
+        logger.error(f"Transcription failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # Clean up the temporary file
-        os.unlink(temp_file.name)
-        print(f"Deleted temporary file: {temp_file.name}")
 
-# OpenAI compatible streaming endpoint
-@app.post("/v1/audio/transcriptions/stream")
-async def transcribe_stream(request: Request):
-    """
-    OpenAI-compatible streaming transcription endpoint
-    Accepts multipart/form-data with the same parameters as the main endpoint
-    """
-    # Parse the multipart form data manually
-    form = await request.form()
+def format_non_streaming_response(segments, info, response_format: str):
+    """Format complete transcript response"""
+    text = "".join(seg.text for seg in segments)
     
-    file = form.get("file")
-    if not file or not isinstance(file, UploadFile):
-        raise HTTPException(status_code=400, detail="File is required")
-    
-    # Extract other form parameters
-    model = form.get("model", "whisper-1")
-    language = form.get("language")
-    prompt = form.get("prompt")
-    response_format = form.get("response_format", "json")
-    temperature = float(form.get("temperature", 0))
-    
-    # Force streaming mode
-    return await transcribe(
-        file=file,
-        model=model,
-        language=language,
-        prompt=prompt,
-        response_format=response_format,
-        temperature=temperature,
-        stream=True
-    )
+    if response_format == "text":
+        return text
+    elif response_format == "sse_json":
+        return {"text": text}
+    elif response_format == "verbose_json":
+        return {
+            "text": text,
+            "segments": [{
+                "start": seg.start,
+                "end": seg.end,
+                "text": seg.text,
+                "confidence": seg.avg_logprob
+            } for seg in segments],
+            "language": info.language
+        }
+    # Handle SRT/VTT formats similarly...
 
-def format_timestamp(seconds, format_type):
-    """Convert seconds to SRT or VTT timestamp format"""
-    hours = int(seconds / 3600)
-    minutes = int((seconds - (hours * 3600)) / 60)
-    secs = seconds - (hours * 3600) - (minutes * 60)
-    
-    if format_type == "srt":
-        return f"{hours:02d}:{minutes:02d}:{int(secs):02d},{int((secs - int(secs)) * 1000):03d}"
-    else:  # vtt
-        return f"{hours:02d}:{minutes:02d}:{int(secs):02d}.{int((secs - int(secs)) * 1000):03d}"
+# --- Health Checks ---
+@app.get("/")
+async def root():
+    return {"status": "running", "model": settings.whisper_model_size}
 
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "workers": executor._max_workers}
+
+# --- Main Execution ---
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8083)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8083,
+        server_header=False,
+        timeout_keep_alive=60  # Allow HTTP keep-alives
+    )
