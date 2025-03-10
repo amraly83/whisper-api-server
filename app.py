@@ -2,7 +2,7 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, sta
 from fastapi.responses import JSONResponse
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import APIKeyHeader, APIKey
+from fastapi.security import APIKeyHeader
 from faster_whisper import WhisperModel
 from io import BytesIO
 import numpy as np
