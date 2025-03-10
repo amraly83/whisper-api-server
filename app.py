@@ -109,12 +109,12 @@ def process_segment(segment, response_format: str) -> Optional[str]:
 
     return {
         "sse_json": lambda: f"data: {json.dumps({'text': segment.text})}\n\n",
-        "verbose_json": lambda: f"data: {json.dumps({
+        "verbose_json": lambda: f"""data: {json.dumps({
             'text': segment.text,
             'start': segment.start,
             'end': segment.end,
-            'confidence': segment.avg_logprob
-        })}\n\n",
+            'confidence': segment.avg_logprobt
+        })}\n\n""",
         "text": lambda: f"{segment.text} ",
         "srt": lambda: format_subtitle(segment, "srt"),
         "vtt": lambda: format_subtitle(segment, "vtt")
