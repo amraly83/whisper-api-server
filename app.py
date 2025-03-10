@@ -156,23 +156,32 @@ async def transcribe(
         raise HTTPException(status_code=400, detail="Unsupported response format")
 
     try:
-        # ======================== FIXED INDENTATION ========================
         # In-memory audio processing (no disk I/O)
-        with timeit_context("Audio processing"):
-            # Read and convert audio to proper format
-            content = await file.read()
-            
-            # Use soundfile to handle various audio formats
-            with BytesIO(content) as audio_buffer:
-                audio_data, sample_rate = sf.read(
-                    audio_buffer,
-                    dtype='float32',
-                    always_2d=True
-                )
-                
-                # Convert to mono if needed
-                if audio_data.ndim > 1:
-                    audio_data = np.mean(audio_data, axis=1)
+with timeit_context("Audio processing"):
+    content = await file.read()
+    
+    try:
+        # Use soundfile with proper error handling
+        with BytesIO(content) as audio_buffer:
+            audio_data, sample_rate = sf.read(
+                audio_buffer,
+                dtype='float32',
+                always_2d=True,
+                fill_value=0.0  # Handle truncated files
+            )
+    except sf.LibsndfileError as e:
+        logger.error(f"Invalid audio file: {str(e)}")
+        raise HTTPException(status_code=400, detail="Invalid audio file format")
+        
+    # Convert to mono and validate content
+    if audio_data.size == 0:
+        raise HTTPException(status_code=400, detail="Empty audio file")
+        
+    if audio_data.ndim > 1:
+        audio_data = np.mean(audio_data, axis=1)
+    
+    # Debug: Verify audio content
+    logger.info(f"Audio loaded: {audio_data.shape} samples, {np.max(audio_data):.2f} max amplitude")
 
         # Configure transcription parameters
         transcribe_params = dict(
@@ -208,7 +217,6 @@ async def transcribe(
 
         # Non-streaming response
         return format_non_streaming_response(segments, info, response_format)
-        # ======================== END FIXED SECTION ========================
 
     except Exception as e:
         logger.error(f"Transcription failed: {str(e)}")
