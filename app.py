@@ -2,7 +2,7 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, sta
 from fastapi.responses import JSONResponse
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import APIKeyHeader
+from fastapi.security import APIKeyHeader, APIKey
 from faster_whisper import WhisperModel
 from io import BytesIO
 import numpy as np
@@ -43,7 +43,7 @@ app.add_middleware(
 )
 
 # Security
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 # Caching and Rate Limiting
 response_cache = TTLCache(maxsize=1000, ttl=settings.cache_ttl)
@@ -82,7 +82,7 @@ async def security_middleware(request: Request, call_next):
 
 # --- Security Dependencies ---
 async def validate_api_key(api_key: str = Depends(api_key_header)):
-    if not api_key or api_key != settings.api_key:
+    if not api_key or not api_key.startswith("Bearer ") or api_key[7:] != settings.api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API key"
