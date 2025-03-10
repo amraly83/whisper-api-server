@@ -7,6 +7,8 @@ services:
       - "8083:8083"
     environment:
       - REDIS_URL=redis://redis:6379/0
+      - PYTHONUNBUFFERED=1
+      - OMP_NUM_THREADS=1
     depends_on:
       - redis
     networks:
