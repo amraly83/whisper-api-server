@@ -1,14 +1,15 @@
-import os
-from pydantic_settings import BaseSettings
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    whisper_model_size: str = os.getenv("MODEL_SIZE", "small")
-    compute_type: str = os.getenv("COMPUTE_TYPE", "int8")  # Set to int8 for quantization
-    device: str = os.getenv("DEVICE", "cpu")  # Explicitly set to CPU
-    beam_size: int = int(os.getenv("BEAM_SIZE", 3)) # Added beam_size setting, default to 3
+    whisper_model_size: str = Field(default="small", env="MODEL_SIZE")
+    compute_type: str = Field(default="int8", env="COMPUTE_TYPE")
+    device: str = Field(default="cpu", env="DEVICE")
+    beam_size: int = Field(default=3, env="BEAM_SIZE")
 
-    model_config = {
-        'protected_namespaces': ('settings_',)
-    }
+    model_config: SettingsConfigDict = SettingsConfigDict(
+        env_file=".env",          # Load variables from .env file
+        env_file_encoding="utf-8"
+    )
 
 settings = Settings()
