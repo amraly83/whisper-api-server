@@ -23,7 +23,7 @@ COPY . .
 EXPOSE 8083
 
 ENV PYTHONUNBUFFERED=1
-ENV OMP_NUM_THREADS=1  # Disables parallel OpenMP operations
+ENV OMP_NUM_THREADS=1
 
 # Command to run the application
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8083"]
