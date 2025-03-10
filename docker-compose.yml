@@ -2,7 +2,11 @@ version: '3.8'
 
 services:
   app:
-    build: .
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
     ports:
       - "8083:8083"
     environment:
