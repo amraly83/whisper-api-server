@@ -1,7 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    
+    whisper_model_size: str = "base"
     api_key: str
     max_duration: int = 600
     rate_limit: int = 100
