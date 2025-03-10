@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from time import time
 from cachetools import TTLCache
 from config import settings
+import subprocess
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -119,6 +120,27 @@ def validate_audio(input_data: bytes) -> np.ndarray:
         logger.error(f"Audio validation failed: {str(e)}")
         raise HTTPException(status_code=400, detail="Invalid audio file")
 
+def convert_to_wav(input_data: bytes) -> bytes:
+    """Converts audio data to 16kHz mono WAV format using ffmpeg."""
+    try:
+        process = subprocess.run(
+            [
+                "ffmpeg",
+                "-i", "pipe:0",  # Read from stdin
+                "-ar", "16000",  # Set sample rate to 16kHz
+                "-ac", "1",  # Set channels to mono
+                "-f", "wav",  # Output format: WAV
+                "pipe:1"  # Write to stdout
+            ],
+            input=input_data,
+            capture_output=True,
+            check=True
+        )
+        return process.stdout
+    except subprocess.CalledProcessError as e:
+        logger.error(f"ffmpeg conversion failed: {e.stderr.decode()}")
+        raise HTTPException(status_code=500, detail="Audio conversion failed")
+
 # --- Core Operations ---
 class TranscriptionResponse(BaseModel):
     text: str
@@ -159,7 +181,9 @@ async def transcribe_audio(
 
         # Process audio
         with timeit_context("audio_processing"):
-            audio_data = validate_audio(content)
+            # Convert to 16kHz mono WAV
+            wav_data = convert_to_wav(content)
+            audio_data = validate_audio(wav_data)
             duration = len(audio_data) / 16000  # Assumes 16kHz sample rate
             if duration > settings.max_duration:
                 raise HTTPException(400, f"Audio exceeds {settings.max_duration}s limit")
@@ -174,8 +198,8 @@ async def transcribe_audio(
                     language=language,
                     initial_prompt=prompt,
                     temperature=temperature,
-                    vad_parameters={"threshold": 0.45, "min_silence_duration_ms": 250}
-                )
+                    vad_parameters={"threshold": 0.45, "min_silence_duration_ms": 250},
+                ),
             )
 
         # Format response
