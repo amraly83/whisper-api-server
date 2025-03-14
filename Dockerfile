@@ -1,11 +1,12 @@
 # Use official Python slim image
 FROM python:3.9-slim
 
-# Install system dependencies
+# Install system dependencies including curl
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     build-essential \
     git \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
