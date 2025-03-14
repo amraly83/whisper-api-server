@@ -461,6 +461,7 @@ def send_webhook_notification(task_id: str):
 @app.post('/v1/audio/transcriptions')
 @limiter.limit(RATE_LIMITS[0])  # Apply rate limiting to endpoint
 async def transcriptions(
+    request: Request,
     model: str = Form(...),
     file: UploadFile = File(...),
     response_format: Optional[str] = Form(None),
