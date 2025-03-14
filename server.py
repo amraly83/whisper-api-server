@@ -563,7 +563,12 @@ async def transcriptions(
                 
             elif response_format == 'verbose_json':
                 cached_result.setdefault('task', WHISPER_DEFAULT_SETTINGS['task'])
-                cached_result.setdefault('duration', cached_result['segments'][-1]['end'])
+                if not cached_result.get('segments') or len(cached_result['segments']) == 0:
+                    cached_result['segments'] = [{'start': 0.0, 'end': 0.0, 'text': ''}]
+                    cached_result.setdefault('duration', 0.0)
+                    logger.warning(f"Empty segments array for cached transcription: {file_hash}")
+                else:
+                    cached_result.setdefault('duration', cached_result['segments'][-1]['end'])
                 if cached_result['language'] == 'ja':
                     cached_result['language'] = 'japanese'
                 return cached_result
@@ -661,7 +666,12 @@ async def transcriptions(
             
         elif response_format == 'verbose_json':
             result.setdefault('task', WHISPER_DEFAULT_SETTINGS['task'])
-            result.setdefault('duration', result['segments'][-1]['end'])
+            if not result.get('segments') or len(result['segments']) == 0:
+                result['segments'] = [{'start': 0.0, 'end': 0.0, 'text': ''}]
+                result.setdefault('duration', 0.0)
+                logger.warning(f"Empty segments array for new transcription: {file_hash}")
+            else:
+                result.setdefault('duration', result['segments'][-1]['end'])
             if result['language'] == 'ja':
                 result['language'] = 'japanese'
             return result
