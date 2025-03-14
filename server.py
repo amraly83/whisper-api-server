@@ -280,6 +280,13 @@ async def transcriptions(
             temp_file_path = temp_file.name
         
         logger.debug(f"File saved to temporary location: {temp_file_path}")
+        logger.debug(f"Checking if file exists at {temp_file_path}: {os.path.exists(temp_file_path)}")
+        if not os.path.exists(temp_file_path):
+            logger.error(f"Temporary file not found at {temp_file_path}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Temporary file not found at {temp_file_path}"
+            )
         file_hash = calculate_file_hash(temp_file_path)
         logger.info(f"File hash: {file_hash}")
 
