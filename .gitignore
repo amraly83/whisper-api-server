@@ -4,6 +4,7 @@ __pycache__/
 *.env
 *.venv
 venv
+server_old.py
 
 # Docker
 uploads/

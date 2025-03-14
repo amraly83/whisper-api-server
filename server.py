@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, Form, UploadFile, File, Depends, HTTPException, status
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, Form, UploadFile, File, Depends, HTTPException, status, Query
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -8,38 +8,350 @@ from slowapi.errors import RateLimitExceeded
 from redis import Redis
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
+from pydantic import BaseModel, HttpUrl, Field, validator
 import asyncio
-
 import os
 import shutil
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
-
+from typing import Optional, Dict, List, Any, Union
 from datetime import timedelta
 import time
-import hmac  # For webhook signature verification
-import requests  # For webhook delivery
-from pydantic import BaseModel, HttpUrl  # For request validation
-from fastapi import Query  # For query parameter validation
-
-import whisper
-import torch
-
-import uvicorn
-import json
+import hmac
+import requests
 import tempfile
 import hashlib
+import uvicorn
+import json
+import psutil
+import uuid
+import gc
+import subprocess
+from enum import Enum
+import mimetypes
 
-# Setup basic logging early
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("whisper-api")
+try:
+    import whisper
+    import torch
+except ImportError:
+    print("Error: Required ML libraries not installed.")
+    print("Install with: pip install openai-whisper torch")
+    exit(1)
 
-# File hashing
+# Enhanced logging with structured format
+class CustomFormatter(logging.Formatter):
+    def format(self, record):
+        log_data = {
+            "timestamp": self.formatTime(record, "%Y-%m-%d %H:%M:%S,%f")[:-3],
+            "level": record.levelname,
+            "name": record.name,
+            "message": record.getMessage(),
+        }
+        
+        if hasattr(record, "request_id"):
+            log_data["request_id"] = record.request_id
+            
+        if record.exc_info:
+            log_data["exception"] = self.formatException(record.exc_info)
+            
+        return json.dumps(log_data)
+
+# Setup logging early
+def setup_logging(log_dir="/var/log/whisper-api", debug=False):
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "whisper-api.log")
+    
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(CustomFormatter())
+    root_logger.addHandler(console_handler)
+    
+    # File handler with rotation
+    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+    file_handler.setFormatter(CustomFormatter())
+    root_logger.addHandler(file_handler)
+    
+    return logging.getLogger("whisper-api")
+
+# Configuration with validation
+class AppConfig:
+    def __init__(self):
+        self.WHISPER_MODEL = os.environ.get('WHISPER_MODEL', 'small')
+        self.API_KEY = os.environ.get('API_KEY')
+        
+        if not self.API_KEY:
+            raise ValueError("API_KEY environment variable is required")
+        
+        try:
+            self.PORT = int(os.environ.get('PORT', '8000'))
+            if self.PORT < 1024 or self.PORT > 65535:
+                raise ValueError(f"Invalid port number: {self.PORT}")
+        except ValueError as e:
+            raise ValueError(f"Invalid PORT configuration: {e}")
+        
+        self.HOST = os.environ.get('HOST', '0.0.0.0')
+        self.UPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/tmp/uploads')
+        self.MAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE', 50 * 1024 * 1024))  # 50MB default
+        os.makedirs(self.UPLOAD_DIR, exist_ok=True)
+        
+        self.DEBUG = os.environ.get('DEBUG', 'false').lower() == 'true'
+        self.ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '*').split(',')
+        self.RATE_LIMITS = os.environ.get('RATE_LIMITS', "10/minute,50/hour").split(',')
+        
+        # New configurations
+        self.MAX_CONCURRENT_TASKS = int(os.environ.get('MAX_CONCURRENT_TASKS', '4'))
+        self.CACHE_DIR = os.environ.get('CACHE_DIR', '/tmp/whisper-cache')
+        os.makedirs(self.CACHE_DIR, exist_ok=True)
+        
+        self.MEMORY_THRESHOLD = float(os.environ.get('MEMORY_THRESHOLD', '0.8'))  # 80% memory threshold
+        self.ALLOWED_AUDIO_TYPES = os.environ.get('ALLOWED_AUDIO_TYPES', 
+                                                 'audio/mpeg,audio/wav,audio/x-wav,audio/ogg').split(',')
+        
+        # Logging config
+        self.LOG_DIR = os.environ.get('LOG_DIR', '/var/log/whisper-api')
+        
+        # Redis configuration
+        self.REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost')
+        self.REDIS_PORT = int(os.environ.get('REDIS_PORT', '6379'))
+        self.REDIS_DB = int(os.environ.get('REDIS_DB', '0'))
+        
+        # Task cleanup configuration
+        self.TASK_RETENTION_HOURS = int(os.environ.get('TASK_RETENTION_HOURS', '24'))
+        
+        # Model management
+        self.MODEL_UNLOAD_IDLE_MINUTES = int(os.environ.get('MODEL_UNLOAD_IDLE_MINUTES', '30'))
+        
+        # Chunking configuration
+        self.CHUNK_SIZE_SECONDS = int(os.environ.get('CHUNK_SIZE_SECONDS', '30'))
+        self.MAX_AUDIO_DURATION = int(os.environ.get('MAX_AUDIO_DURATION', '300'))  # 5 minutes max
+        
+# Request ID middleware for tracking requests
+class RequestIDMiddleware:
+    async def __call__(self, request: Request, call_next):
+        request_id = str(uuid.uuid4())
+        request.state.request_id = request_id
+        
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            return response
+        except Exception as exc:
+            logger.error(f"Request {request_id} failed", exc_info=True)
+            raise
+
+# Enhanced logging middleware
+class LoggingMiddleware:
+    async def __call__(self, request: Request, call_next):
+        start_time = time.time()
+        request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+        
+        # Add request_id to log records
+        old_factory = logging.getLogRecordFactory()
+        def record_factory(*args, **kwargs):
+            record = old_factory(*args, **kwargs)
+            record.request_id = request_id
+            return record
+        logging.setLogRecordFactory(record_factory)
+        
+        logger.info(f"Request started: {request.method} {request.url.path}")
+        
+        try:
+            response = await call_next(request)
+            duration = time.time() - start_time
+            
+            logger.info(
+                f"Request completed: {request.method} {request.url.path} "
+                f"status={response.status_code} duration={duration:.3f}s"
+            )
+            
+            # Update metrics
+            update_metrics(response.status_code, duration)
+            
+            return response
+        except Exception as exc:
+            duration = time.time() - start_time
+            logger.error(
+                f"Request failed: {request.method} {request.url.path} "
+                f"duration={duration:.3f}s",
+                exc_info=True
+            )
+            raise
+        finally:
+            # Reset log record factory
+            logging.setLogRecordFactory(old_factory)
+            
+            # Log memory usage periodically
+            if random.random() < 0.1:  # 10% sampling
+                log_system_metrics()
+
+# Models and type definitions
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+class Webhook(BaseModel):
+    url: HttpUrl
+    secret: Optional[str] = None
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "url": "https://example.com/webhook",
+                "secret": "your_webhook_secret"
+            }
+        }
+
+class TranscriptionRequest(BaseModel):
+    model: str = Field(..., description="Model to use for transcription")
+    response_format: Optional[str] = Field(None, description="Response format (json, text, srt, vtt, verbose_json)")
+    language: Optional[str] = Field(None, description="Language code for transcription")
+    prompt: Optional[str] = Field(None, description="Initial prompt for transcription")
+    temperature: Optional[float] = Field(0.0, description="Sampling temperature (0.0 to 1.0)")
+    
+    @validator('model')
+    def validate_model(cls, v):
+        if v != "whisper-1":
+            raise ValueError("Only 'whisper-1' model is supported")
+        return v
+    
+    @validator('response_format')
+    def validate_format(cls, v):
+        if v is None:
+            return 'json'
+        if v not in ['json', 'text', 'srt', 'verbose_json', 'vtt']:
+            raise ValueError(f"Unsupported format: {v}")
+        return v
+    
+    @validator('temperature')
+    def validate_temperature(cls, v):
+        if v is None:
+            return 0.0
+        if v < 0.0 or v > 1.0:
+            raise ValueError(f"Temperature must be between 0.0 and 1.0")
+        return v
+
+class TaskResult(BaseModel):
+    text: str
+    language: Optional[str] = None
+    segments: Optional[List[Dict[str, Any]]] = None
+    task: Optional[str] = None
+    duration: Optional[float] = None
+
+# Global state
+config = AppConfig()
+logger = setup_logging(config.LOG_DIR, config.DEBUG)
+security = HTTPBearer(auto_error=False)
+
+# Use limiter with Redis backend if available
+try:
+    redis_client = Redis(
+        host=config.REDIS_HOST, 
+        port=config.REDIS_PORT, 
+        db=config.REDIS_DB, 
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=5
+    )
+    redis_client.ping()  # Test connection
+    logger.info(f"Connected to Redis at {config.REDIS_HOST}:{config.REDIS_PORT}")
+    limiter = Limiter(key_func=get_remote_address, storage_uri=f"redis://{config.REDIS_HOST}:{config.REDIS_PORT}")
+except Exception as e:
+    logger.warning(f"Redis connection failed: {str(e)}. Using in-memory storage")
+    limiter = Limiter(key_func=get_remote_address)
+
+# Thread pools
+worker_pool = ThreadPoolExecutor(max_workers=config.MAX_CONCURRENT_TASKS)
+
+# Task and cache management
+active_tasks: Dict[str, Dict[str, Any]] = {}
+transcription_cache: Dict[str, Dict[str, Any]] = {}
+task_last_accessed: Dict[str, float] = {}
+model_last_used = time.time()
+
+# Whisper model and settings
+whisper_model = None
+whisper_model_lock = asyncio.Lock()
+random = __import__('random')
+
+WHISPER_DEFAULT_SETTINGS = {
+    "temperature": 0.0,
+    "temperature_increment_on_fallback": 0.2,
+    "no_speech_threshold": 0.6,
+    "logprob_threshold": -1.0,
+    "compression_ratio_threshold": 2.4,
+    "condition_on_previous_text": True,
+    "verbose": False,
+    "task": "transcribe",
+    "fp16": False
+}
+
+# Performance metrics
+performance_metrics = {
+    "total_requests": 0,
+    "success_count": 0,
+    "error_count": 0,
+    "average_response_time": 0,
+    "response_times": [],
+    "peak_memory_usage": 0,
+    "current_memory_usage": 0,
+    "model_load_count": 0
+}
+
+# Utility functions
+def update_metrics(status_code: int, duration: float):
+    """Update performance metrics"""
+    performance_metrics["total_requests"] += 1
+    performance_metrics["response_times"].append(duration)
+    
+    # Limit stored response times to avoid memory growth
+    if len(performance_metrics["response_times"]) > 1000:
+        performance_metrics["response_times"] = performance_metrics["response_times"][-1000:]
+    
+    performance_metrics["average_response_time"] = sum(performance_metrics["response_times"]) / len(performance_metrics["response_times"])
+    
+    if 200 <= status_code < 400:
+        performance_metrics["success_count"] += 1
+    else:
+        performance_metrics["error_count"] += 1
+    
+    # Update memory usage
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    memory_usage_mb = memory_info.rss / (1024 * 1024)
+    performance_metrics["current_memory_usage"] = memory_usage_mb
+    
+    if memory_usage_mb > performance_metrics["peak_memory_usage"]:
+        performance_metrics["peak_memory_usage"] = memory_usage_mb
+
+def log_system_metrics():
+    """Log system resource usage metrics"""
+    # Memory usage (RAM)
+    memory = psutil.virtual_memory()
+    # CPU usage
+    cpu_percent = psutil.cpu_percent(interval=0.1)
+    # Disk usage
+    disk = psutil.disk_usage('/')
+    
+    logger.info(
+        f"System metrics: CPU={cpu_percent}%, "
+        f"Memory={memory.percent}% ({memory.used/1024/1024:.1f}MB/{memory.total/1024/1024:.1f}MB), "
+        f"Disk={disk.percent}% ({disk.used/1024/1024/1024:.1f}GB/{disk.total/1024/1024/1024:.1f}GB)"
+    )
+    
+    # Check if memory usage is approaching threshold
+    if memory.percent > config.MEMORY_THRESHOLD * 100:
+        logger.warning(f"Memory usage above threshold: {memory.percent}%")
+        # Force garbage collection
+        gc.collect()
+        if 'whisper_model' in globals() and whisper_model is not None:
+            logger.warning("High memory pressure - consider unloading model")
+
 def calculate_file_hash(file_path: str) -> str:
     """Calculate SHA256 hash of a file"""
     sha256_hash = hashlib.sha256()
@@ -48,132 +360,120 @@ def calculate_file_hash(file_path: str) -> str:
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
 
-# Async transcription wrapper
-async def async_transcribe(audio_path: str, **whisper_args):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(worker_pool, transcribe, audio_path, **whisper_args)
+def validate_audio_file(file_path: str) -> bool:
+    """Validate audio file using ffprobe"""
+    try:
+        mime_type = mimetypes.guess_type(file_path)[0]
+        if mime_type and mime_type.startswith('audio/'):
+            # Get audio duration using ffprobe
+            cmd = [
+                'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1', file_path
+            ]
+            duration = float(subprocess.check_output(cmd).decode('utf-8').strip())
+            
+            if duration > config.MAX_AUDIO_DURATION:
+                logger.warning(f"Audio file too long: {duration}s > {config.MAX_AUDIO_DURATION}s")
+                return False
+                
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Audio validation failed: {str(e)}")
+        return False
 
-# Enhanced Configuration
-WHISPER_MODEL = os.environ.get('WHISPER_MODEL', 'small')
-API_KEY = os.environ.get('API_KEY')
-if not API_KEY:
-    print("[ERROR] API_KEY environment variable is required")
-    raise SystemExit("API_KEY environment variable is required")
-
-PORT = os.environ.get('PORT', '8000')
-try:
-    PORT = int(PORT)
-    if PORT < 1024 or PORT > 65535:
-        raise ValueError(f"Invalid port number: {PORT}")
-except ValueError as e:
-    print(f"[ERROR] Invalid PORT configuration: {e}")
-    raise SystemExit(f"Invalid PORT configuration: {e}")
-
-HOST = os.environ.get('HOST', '0.0.0.0')
-UPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/tmp/uploads')
-MAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE', 50 * 1024 * 1024))  # 50MB default
-os.makedirs(UPLOAD_DIR, exist_ok=True)  # Ensure upload directory exists
-
-DEBUG = os.environ.get('DEBUG', 'false').lower() == 'true'
-
-# Additional security settings
-MAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE', 50 * 1024 * 1024))  # 50MB default
-ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '*').split(',')
-RATE_LIMITS = os.environ.get('RATE_LIMITS', "10/minute,50/hour").split(',')
-
-
-# Enhanced logging setup
-class LoggingMiddleware:
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        
-        start_time = time.time()
-        req_body = b""
-        
-        async def receive_wrapper():
-            nonlocal req_body
-            message = await receive()
-            if message["type"] == "http.request":
-                req_body += message.get("body", b"")
-            return message
-        
-        response_status = None
-        res_body = b""
-        
-        async def send_wrapper(message):
-            nonlocal response_status, res_body
-            if message["type"] == "http.response.start":
-                response_status = message["status"]
-            elif message["type"] == "http.response.body":
-                res_body += message.get("body", b"")
-            await send(message)
+async def load_whisper_model():
+    """Load whisper model with memory optimizations"""
+    global whisper_model, model_last_used
+    
+    async with whisper_model_lock:
+        if whisper_model is not None:
+            # Model already loaded
+            model_last_used = time.time()
+            return whisper_model
+            
+        logger.info(f"Loading Whisper model: {config.WHISPER_MODEL}")
+        device = "cpu"  # Force CPU mode for 4GB RAM constraint
         
         try:
-            await self.app(scope, receive_wrapper, send_wrapper)
-        except Exception as e:
-            logger.error(f"Request failed: {str(e)}", exc_info=True)
-            raise
-        finally:
-            duration = int((time.time() - start_time) * 1000)
-            log_data = {
-                "method": scope["method"],
-                "path": scope["path"],
-                "status_code": response_status,
-                "duration_ms": duration,
-                "request_size": len(req_body),
-                "response_size": len(res_body),
-            }
-            logger.info(f"API Request: {json.dumps(log_data)}")
+            # Optimize for CPU with limited memory
+            torch.set_num_threads(min(4, os.cpu_count() or 4))  # Limit CPU threads
+            torch.backends.quantized.engine = 'qnnpack'  # Enable quantization for ARM
             
-            # Log errors separately
-            if response_status and response_status >= 400:
-                error_data = {
-                    "error": {
-                        "status_code": response_status,
-                        "path": scope["path"],
-                        "method": scope["method"],
-                        "response": res_body.decode(errors="ignore"),
-                        "duration_ms": duration
-                    }
-                }
-                logger.error(f"API Error: {json.dumps(error_data)}")
+            # Load model with reduced memory footprint
+            whisper_model = whisper.load_model(
+                config.WHISPER_MODEL,
+                device=device,
+                in_memory=False,  # Reduce memory usage
+                download_root=config.CACHE_DIR  # Cache model files
+            )
+            
+            # Record metrics
+            performance_metrics["model_load_count"] += 1
+            model_last_used = time.time()
+            
+            logger.info("Whisper model loaded successfully")
+            return whisper_model
+            
+        except Exception as e:
+            logger.error(f"Failed to load model: {str(e)}", exc_info=True)
+            raise
 
-# Setup logging
-logging.basicConfig(
-    level=logging.DEBUG if DEBUG else logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-)
-logger = logging.getLogger("whisper-api")
-
-# Performance metrics
-performance_metrics = {
-    "total_requests": 0,
-    "success_count": 0,
-    "error_count": 0,
-    "average_response_time": 0,
-    "response_times": []
-}
-
-def update_metrics(status_code: int, duration: float):
-    """Update performance metrics"""
-    performance_metrics["total_requests"] += 1
-    performance_metrics["response_times"].append(duration)
-    performance_metrics["average_response_time"] = sum(performance_metrics["response_times"]) / len(performance_metrics["response_times"])
+async def unload_whisper_model_if_idle():
+    """Unload whisper model if it's been idle for too long"""
+    global whisper_model
     
-    if 200 <= status_code < 400:
-        performance_metrics["success_count"] += 1
-    else:
-        performance_metrics["error_count"] += 1
+    if whisper_model is None:
+        return
+        
+    idle_minutes = (time.time() - model_last_used) / 60
+    
+    if idle_minutes >= config.MODEL_UNLOAD_IDLE_MINUTES:
+        async with whisper_model_lock:
+            if whisper_model is not None:
+                logger.info(f"Unloading model after {idle_minutes:.1f} minutes of inactivity")
+                del whisper_model
+                whisper_model = None
+                # Force garbage collection
+                gc.collect()
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-# Security setup
-security = HTTPBearer(auto_error=False)
+async def periodic_cleanup():
+    """Periodic cleanup task for managing memory and cache"""
+    while True:
+        try:
+            # Clean up old tasks
+            current_time = time.time()
+            expired_tasks = []
+            
+            for task_id, last_accessed in task_last_accessed.items():
+                if current_time - last_accessed > config.TASK_RETENTION_HOURS * 3600:
+                    expired_tasks.append(task_id)
+            
+            for task_id in expired_tasks:
+                if task_id in active_tasks:
+                    del active_tasks[task_id]
+                if task_id in task_last_accessed:
+                    del task_last_accessed[task_id]
+                if task_id in webhooks:
+                    del webhooks[task_id]
+                    
+            logger.debug(f"Cleaned up {len(expired_tasks)} expired tasks")
+            
+            # Check if model should be unloaded
+            await unload_whisper_model_if_idle()
+            
+            # Log current system metrics
+            log_system_metrics()
+            
+        except Exception as e:
+            logger.error(f"Error in cleanup task: {str(e)}", exc_info=True)
+            
+        await asyncio.sleep(300)  # Run every 5 minutes
 
+# Authentication
 async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify the API key provided in the request"""
     if not credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -188,7 +488,7 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
             headers={"WWW-Authenticate": "Bearer"}
         )
     
-    if credentials.credentials != API_KEY:
+    if not hmac.compare_digest(credentials.credentials, config.API_KEY):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
@@ -196,63 +496,249 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
         )
     
     return credentials.credentials
-# Rate limiting setup
-redis_client = Redis(host='redis', port=6379, db=0, decode_responses=True)
-limiter = Limiter(key_func=get_remote_address, storage_uri="redis://redis:6379")
 
-# Global model and async processing
-whisper_model = None
-task_queue = Queue()
-worker_pool = ThreadPoolExecutor(max_workers=4)
+# Transcription core functionality
+async def async_transcribe(audio_path: str, task_id: str, **whisper_args):
+    """Async wrapper for transcription"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        worker_pool, 
+        lambda: transcribe(audio_path, task_id, **whisper_args)
+    )
 
-# Rate limit configuration (adjust based on server capacity)
-RATE_LIMITS = ["10/minute", "50/hour"]  # Max 10 requests per minute, 50 per hour
+def transcribe(audio_path: str, task_id: str, **whisper_args):
+    """Transcribe audio with optimized chunking for memory-constrained environments"""
+    global model_last_used, whisper_model
 
-# Task tracking and caching
-active_tasks = {}  # {task_id: {"status": "pending|processing|complete", "result": None}}
-transcription_cache = {}  # {file_hash: transcription_result}
-task_id_counter = 0
+    # Update task status
+    active_tasks[task_id]["status"] = TaskStatus.PROCESSING
+    
+    # Set configs for temperature
+    if whisper_args.get("temperature_increment_on_fallback") is not None:
+        whisper_args["temperature"] = [
+            whisper_args["temperature"] + i * whisper_args["temperature_increment_on_fallback"]
+            for i in range(int((1.0 - whisper_args["temperature"]) / whisper_args["temperature_increment_on_fallback"]) + 1)
+        ]
+    else:
+        whisper_args["temperature"] = [whisper_args["temperature"]]
 
-# Whisper default settings
-WHISPER_DEFAULT_SETTINGS = {
-    "temperature": 0.0,
-    "temperature_increment_on_fallback": 0.2,
-    "no_speech_threshold": 0.6,
-    "logprob_threshold": -1.0,
-    "compression_ratio_threshold": 2.4,
-    "condition_on_previous_text": True,
-    "verbose": False,
-    "task": "transcribe",
-    "fp16": False  # Ensure FP16 is disabled
-}
+    del whisper_args["temperature_increment_on_fallback"]
 
+    logger.debug(f"Transcribing with args: {whisper_args}")
+    start_time = time.time()
+    
+    try:
+        # Load model synchronously if needed - this is inside executor thread
+        if whisper_model is None:
+            # We're in a worker thread so we can't use async
+            logger.info("Loading model from worker thread")
+            device = "cpu"
+            torch.set_num_threads(min(4, os.cpu_count() or 4))
+            torch.backends.quantized.engine = 'qnnpack'
+            
+            whisper_model = whisper.load_model(
+                config.WHISPER_MODEL,
+                device=device,
+                in_memory=False,
+                download_root=config.CACHE_DIR
+            )
+            performance_metrics["model_load_count"] += 1
+        
+        # Process audio in optimized chunks to minimize memory usage
+        model_last_used = time.time()
+        chunk_size = config.CHUNK_SIZE_SECONDS  # seconds
+        
+        # Load full audio - but we'll process in chunks
+        audio = whisper.load_audio(audio_path)
+        total_duration = len(audio) / whisper.audio.SAMPLE_RATE
+        logger.info(f"Audio duration: {total_duration:.2f} seconds")
+        
+        transcripts = []
+        all_segments = []
+        
+        # Process in chunks with memory cleanup between chunks
+        for start in range(0, int(total_duration), chunk_size):
+            end = min(start + chunk_size, total_duration)
+            logger.debug(f"Processing chunk {start}-{end} seconds")
+            
+            # Extract audio chunk
+            start_sample = int(start * whisper.audio.SAMPLE_RATE)
+            end_sample = int(end * whisper.audio.SAMPLE_RATE)
+            audio_chunk = audio[start_sample:end_sample]
+            
+            # Transcribe chunk
+            result = whisper_model.transcribe(
+                audio_chunk,
+                **whisper_args
+            )
+            
+            # Adjust segment timestamps
+            for segment in result["segments"]:
+                segment["start"] += start
+                segment["end"] += start
+                all_segments.append(segment)
+            
+            transcripts.append(result["text"])
+            
+            # Clear memory after each chunk
+            del audio_chunk
+            if start % (chunk_size * 3) == 0:  # Every 3 chunks
+                gc.collect()
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        # Combine results
+        combined_transcript = {
+            'text': ' '.join(transcripts).strip(),
+            'segments': all_segments,
+            'language': whisper_args.get('language') or (result.get('language') if result else None),
+            'task': whisper_args.get('task', 'transcribe'),
+        }
+        
+        # Add duration
+        if all_segments:
+            combined_transcript['duration'] = all_segments[-1]['end']
+        else:
+            combined_transcript['duration'] = total_duration
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"Transcription completed in {elapsed_time:.2f} seconds")
+        
+        # Update task status and result
+        active_tasks[task_id]["status"] = TaskStatus.COMPLETE
+        active_tasks[task_id]["result"] = combined_transcript
+        task_last_accessed[task_id] = time.time()
+        
+        # Post-process for compatibility
+        if combined_transcript.get('language') == 'ja':
+            combined_transcript['language'] = 'japanese'
+            
+        return combined_transcript
+        
+    except Exception as e:
+        logger.error(f"Transcription failed: {str(e)}", exc_info=True)
+        active_tasks[task_id]["status"] = TaskStatus.FAILED
+        active_tasks[task_id]["error"] = str(e)
+        raise
+
+def generate_task_id() -> str:
+    """Generate unique task ID"""
+    return str(uuid.uuid4())
+
+def format_response(result: dict, response_format: str) -> Union[dict, str]:
+    """Format transcription result based on requested format"""
+    if response_format == 'text':
+        return result['text']
+        
+    elif response_format == 'srt':
+        ret = ""
+        for i, seg in enumerate(result['segments'], 1):
+            td_s = timedelta(seconds=seg["start"])
+            td_e = timedelta(seconds=seg["end"])
+            
+            t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02},{td_s.microseconds//1000:03}'
+            t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02},{td_e.microseconds//1000:03}'
+            
+            ret += f'{i}\n{t_s} --> {t_e}\n{seg["text"]}\n\n'
+        return ret
+        
+    elif response_format == 'vtt':
+        ret = "WEBVTT\n\n"
+        for seg in result['segments']:
+            td_s = timedelta(seconds=seg["start"])
+            td_e = timedelta(seconds=seg["end"])
+            
+            t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
+            t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
+            
+            ret += f"{t_s} --> {t_e}\n{seg['text']}\n\n"
+        return ret
+        
+    elif response_format == 'verbose_json':
+        # Ensure all fields are present
+        result.setdefault('task', 'transcribe')
+        
+        if not result.get('segments') or len(result['segments']) == 0:
+            result['segments'] = [{'start': 0.0, 'end': 0.0, 'text': ''}]
+            result.setdefault('duration', 0.0)
+        else:
+            result.setdefault('duration', result['segments'][-1]['end'])
+            
+        return result
+        
+    else:  # json (default)
+        return {'text': result['text']}
+
+# Webhook handling
+webhooks = {}  # {task_id: {"url": webhook_url, "secret": webhook_secret}}
+
+def send_webhook_notification(task_id: str):
+    """Send webhook notification for task completion"""
+    if task_id not in webhooks:
+        return
+    
+    webhook = webhooks[task_id]
+    task = active_tasks[task_id]
+    
+    payload = {
+        "task_id": task_id,
+        "status": task["status"],
+    }
+    
+    if task["status"] == TaskStatus.COMPLETE:
+        payload["result"] = {"text": task["result"]["text"]}
+    elif task["status"] == TaskStatus.FAILED:
+        payload["error"] = task.get("error", "Unknown error")
+    
+    headers = {"Content-Type": "application/json"}
+    if webhook['secret']:
+        signature = hmac.new(
+            webhook['secret'].encode(),
+            json.dumps(payload).
+
+    webhook['secret'].encode(),
+            json.dumps(payload).encode(),
+            hashlib.sha256
+        ).hexdigest()
+        headers['X-Webhook-Signature'] = signature
+    
+    try:
+        response = requests.post(
+            webhook['url'],
+            json=payload,
+            headers=headers,
+            timeout=5
+        )
+        logger.info(f"Webhook delivery for task {task_id}: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Webhook delivery failed for task {task_id}: {str(e)}")
+
+# FastAPI App Setup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global whisper_model
-    # Load the ML model with CPU optimizations
-    logger.info(f"Loading Whisper model: {WHISPER_MODEL}")
-    device = "cpu"
-    logger.info(f"Using device: {device}")
+    """Application lifespan manager - startup and shutdown operations"""
+    # Start background task for periodic cleanup
+    cleanup_task = asyncio.create_task(periodic_cleanup())
     
-    # Load model with reduced memory footprint
-    whisper_model = whisper.load_model(
-        WHISPER_MODEL,
-        device=device,
-        in_memory=False,  # Reduce memory usage
-        download_root="/tmp/whisper"  # Cache model files
-    )
+    logger.info(f"Starting Whisper API server with model: {config.WHISPER_MODEL}")
+    logger.info(f"Server configured to use up to {config.MAX_CONCURRENT_TASKS} concurrent tasks")
     
-    # Enable CPU optimizations
-    torch.set_num_threads(4)  # Limit CPU threads
-    torch.backends.quantized.engine = 'qnnpack'  # Enable quantization
-    logger.info("Whisper model loaded successfully")
-
     yield
-
-    # Clean up the ML models and release the resources
-    logger.info("Shutting down, releasing resources")
-    del whisper_model
-    whisper_model = None
+    
+    # Shutdown operations
+    logger.info("Shutting down, cleaning up resources")
+    cleanup_task.cancel()
+    
+    # Release model resources
+    global whisper_model
+    if whisper_model:
+        logger.info("Unloading Whisper model")
+        del whisper_model
+        whisper_model = None
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    # Shutdown thread pool
+    worker_pool.shutdown(wait=False)
 
 app = FastAPI(
     title="Whisper API",
@@ -261,99 +747,63 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Add logging middleware
-app.add_middleware(LoggingMiddleware)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+# Add middleware
+app.add_middleware(CORSMiddleware,
+    allow_origins=config.ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Authentication dependency
-
-# Generate unique task ID
-def generate_task_id() -> str:
-    global task_id_counter
-    task_id_counter += 1
-    return str(task_id_counter)
-
-# Whisper transcription function
-def transcribe(audio_path: str, task_id: str, **whisper_args):
-    """Transcribe the audio file using whisper with chunked processing"""
-    global whisper_model
-
-    # Set configs & transcribe
-    if whisper_args["temperature_increment_on_fallback"] is not None:
-            whisper_args["temperature"] = [
-                whisper_args["temperature"] + i * whisper_args["temperature_increment_on_fallback"]
-                for i in range(int((1.0 - whisper_args["temperature"]) / whisper_args["temperature_increment_on_fallback"]) + 1)
-            ]
-    else:
-        whisper_args["temperature"] = [whisper_args["temperature"]]
-
-    del whisper_args["temperature_increment_on_fallback"]
-
-    logger.debug(f"Transcribing with args: {whisper_args}")
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    """Middleware to track request duration and add it to response headers"""
     start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time"] = str(process_time)
+    return response
 
-    # Update task status
-    active_tasks[task_id]["status"] = "processing"
-    
-    # Process audio in chunks to reduce memory usage
-    chunk_size = 30  # seconds
-    audio = whisper.load_audio(audio_path)
-    total_duration = len(audio) / whisper.audio.SAMPLE_RATE
-    transcripts = []
-    
-    for start in range(0, int(total_duration), chunk_size):
-        end = min(start + chunk_size, total_duration)
-        logger.debug(f"Processing chunk {start}-{end} seconds")
-        
-        # Extract audio chunk
-        start_sample = int(start * whisper.audio.SAMPLE_RATE)
-        end_sample = int(end * whisper.audio.SAMPLE_RATE)
-        audio_chunk = audio[start_sample:end_sample]
-        
-        # Transcribe chunk
-        chunk_transcript = whisper_model.transcribe(
-            audio_chunk,
-            **whisper_args,
-        )
-        transcripts.append(chunk_transcript)
-        
-        # Clear memory
-        del audio_chunk
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    
-    # Combine transcripts
-    combined_transcript = {
-        'text': ' '.join([t['text'] for t in transcripts]),
-        'segments': [seg for t in transcripts for seg in t['segments']],
-        'language': transcripts[0]['language'] if transcripts else None
+# Error handlers
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """Custom rate limit exceeded handler"""
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={
+            "error": "Rate limit exceeded", 
+            "retry_after": getattr(exc, 'retry_after', 60)
+        },
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler for unhandled errors"""
+    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"error": "An unexpected error occurred", "detail": str(exc)},
+    )
+
+# API Endpoints
+@app.get("/health")
+async def health_check():
+    """Health check endpoint with system metrics"""
+    memory = psutil.virtual_memory()
+    return {
+        "status": "healthy",
+        "version": "1.0.0",
+        "time": time.time(),
+        "metrics": {
+            "requests": performance_metrics["total_requests"],
+            "success_rate": (performance_metrics["success_count"] / max(1, performance_metrics["total_requests"])) * 100,
+            "avg_response_time": performance_metrics["average_response_time"],
+            "system": {
+                "memory_used_percent": memory.percent,
+                "cpu_percent": psutil.cpu_percent(interval=0.1),
+            }
+        }
     }
-    
-    elapsed_time = time.time() - start_time
-    logger.info(f"Transcription completed in {elapsed_time:.2f} seconds")
-    
-    # Log memory usage
-    if torch.cuda.is_available():
-        mem_usage = torch.cuda.memory_allocated() / 1024**2
-        logger.info(f"GPU memory usage: {mem_usage:.2f} MB")
-    else:
-        import psutil
-        process = psutil.Process()
-        mem_usage = process.memory_info().rss / 1024**2
-        logger.info(f"RAM usage: {mem_usage:.2f} MB")
-
-    # Update task status and cache result
-    active_tasks[task_id]["status"] = "complete"
-    active_tasks[task_id]["result"] = combined_transcript
-
-    return combined_transcript
 
 @app.get("/v1/audio/transcriptions/{task_id}")
 async def get_transcription_status(
@@ -363,7 +813,10 @@ async def get_transcription_status(
     api_key: str = Depends(verify_api_key)
 ):
     """
-    Get the status or result of a transcription task with pagination
+    Get the status or result of a transcription task with pagination.
+    
+    Returns either the completion status or the full transcription results
+    with pagination for large transcriptions.
     """
     if task_id not in active_tasks:
         raise HTTPException(
@@ -371,22 +824,26 @@ async def get_transcription_status(
             detail=f"Task ID not found: {task_id}"
         )
 
+    # Update last accessed time for this task
+    task_last_accessed[task_id] = time.time()
     task = active_tasks[task_id]
-    if task["status"] != "complete":
+    
+    if task["status"] != TaskStatus.COMPLETE:
         return {"status": task["status"]}
     
-    # Paginate results
+    # For completed transcriptions, paginate the results
     result = task["result"]
-    total_segments = len(result['segments'])
+    total_segments = len(result.get('segments', []))
     start_idx = (page - 1) * page_size
     end_idx = start_idx + page_size
     
-    paginated_segments = result['segments'][start_idx:end_idx]
+    paginated_segments = result.get('segments', [])[start_idx:end_idx]
     has_more = end_idx < total_segments
     
     return {
+        "status": "complete",
         "text": result['text'],
-        "language": result['language'],
+        "language": result.get('language'),
         "total_segments": total_segments,
         "page": page,
         "page_size": page_size,
@@ -394,21 +851,8 @@ async def get_transcription_status(
         "segments": paginated_segments
     }
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy"}
-
-
-# Webhook model
-class Webhook(BaseModel):
-    url: HttpUrl
-    secret: Optional[str] = None
-
-webhooks = {}  # {task_id: {"url": webhook_url, "secret": webhook_secret}}
-
 @app.post('/v1/webhooks')
-@limiter.limit(RATE_LIMITS[1])  # Apply less strict rate limit for webhooks
+@limiter.limit(config.RATE_LIMITS[1])  # Apply less strict rate limit for webhooks
 async def register_webhook(
     request: Request,
     webhook: Webhook,
@@ -416,7 +860,9 @@ async def register_webhook(
     api_key: str = Depends(verify_api_key)
 ):
     """
-    Register a webhook for transcription completion notifications
+    Register a webhook for transcription completion notifications.
+    
+    The webhook will be called when the transcription task completes or fails.
     """
     if task_id not in active_tasks:
         raise HTTPException(
@@ -425,314 +871,222 @@ async def register_webhook(
         )
     
     webhooks[task_id] = {
-        "url": webhook.url,
+        "url": str(webhook.url),
         "secret": webhook.secret
     }
     
-    return {"message": "Webhook registered successfully"}
-
-def send_webhook_notification(task_id: str):
-    """Send webhook notification in background"""
-    if task_id not in webhooks:
-        return
-    
-    webhook = webhooks[task_id]
-    task = active_tasks[task_id]
-    
-    headers = {}
-    if webhook['secret']:
-        signature = hmac.new(
-            webhook['secret'].encode(),
-            json.dumps(task).encode(),
-            hashlib.sha256
-        ).hexdigest()
-        headers['X-Webhook-Signature'] = signature
-    
-    try:
-        requests.post(
-            webhook['url'],
-            json=task,
-            headers=headers,
-            timeout=5
-        )
-    except Exception as e:
-        logger.error(f"Webhook delivery failed for task {task_id}: {str(e)}")
+    return {"message": "Webhook registered successfully", "task_id": task_id}
 
 @app.post('/v1/audio/transcriptions')
-@limiter.limit(RATE_LIMITS[0])  # Apply rate limiting to endpoint
-async def transcriptions(
+@limiter.limit(config.RATE_LIMITS[0])
+async def transcribe_audio(
     request: Request,
-    model: str = Form(...),
     file: UploadFile = File(...),
+    model: str = Form("whisper-1"),
     response_format: Optional[str] = Form(None),
     language: Optional[str] = Form(None),
     prompt: Optional[str] = Form(None),
-    temperature: Optional[float] = Form(None),
+    temperature: Optional[float] = Form(0.0),
     webhook_url: Optional[str] = Form(None),
     webhook_secret: Optional[str] = Form(None),
     api_key: str = Depends(verify_api_key)
 ):
+    """
+    Transcribe audio file to text.
+    
+    This endpoint accepts audio files and transcribes them using the Whisper model.
+    It supports both synchronous and asynchronous (webhook-based) transcription.
+    """
+    # Process and validate request parameters
+    try:
+        req = TranscriptionRequest(
+            model=model,
+            response_format=response_format,
+            language=language,
+            prompt=prompt,
+            temperature=temperature
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    
+    # Check current system load
+    memory = psutil.virtual_memory()
+    if memory.percent > 85:  # Over 85% memory usage
+        logger.warning(f"System under high memory load: {memory.percent}%")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server under high load, please try again later",
+            headers={"Retry-After": "60"}
+        )
+    
     # Check file size
-    if file.size > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE} bytes"
-        )
-        
-    logger.info(f"Received transcription request for file: {file.filename}")
+    if hasattr(file, 'size'):
+        if file.size > config.MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"File size exceeds maximum allowed size of {config.MAX_FILE_SIZE // (1024 * 1024)} MB"
+            )
     
-    # Existing code...
+    # Generate task ID and initialize task
+    task_id = generate_task_id()
+    active_tasks[task_id] = {"status": TaskStatus.PENDING, "result": None}
+    task_last_accessed[task_id] = time.time()
     
-    # Validate model
-    if model != "whisper-1":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported model: {model}. Only 'whisper-1' is supported"
-        )
+    # Process webhook registration if provided
+    if webhook_url:
+        webhooks[task_id] = {
+            "url": webhook_url,
+            "secret": webhook_secret
+        }
     
-    # Validate response_format
-    if response_format is None:
-        response_format = 'json'
-    if response_format not in ['json', 'text', 'srt', 'verbose_json', 'vtt']:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported response_format: {response_format}"
-        )
+    logger.info(f"Processing transcription request for file: {file.filename} (Task ID: {task_id})")
     
-    # Validate temperature
-    if temperature is None:
-        temperature = 0.0
-    if temperature < 0.0 or temperature > 1.0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid temperature: {temperature}. Must be between 0.0 and 1.0"
-        )
-
-    # Create temporary file and calculate hash
+    # Create temporary file for processing
     temp_file_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as temp_file:
-            # Copy uploaded file to temporary file
+            # Save uploaded file
             shutil.copyfileobj(file.file, temp_file)
             temp_file_path = temp_file.name
         
-        logger.debug(f"File saved to temporary location: {temp_file_path}")
-        logger.debug(f"Checking if file exists at {temp_file_path}: {os.path.exists(temp_file_path)}")
-        if not os.path.exists(temp_file_path):
-            logger.error(f"Temporary file not found at {temp_file_path}")
+        # Validate file is audio and get duration
+        if not validate_audio_file(temp_file_path):
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Temporary file not found at {temp_file_path}"
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="File is not a valid audio file or exceeds maximum duration"
             )
+        
+        # Calculate file hash for caching
         file_hash = calculate_file_hash(temp_file_path)
-        logger.info(f"File hash: {file_hash}")
-
-        # Check if transcription is already cached
+        
+        # Check if transcription is already in cache
         if file_hash in transcription_cache:
-            logger.info(f"Transcription found in cache for hash: {file_hash}")
-            cached_result = transcription_cache[file_hash]
+            logger.info(f"Using cached transcription for file hash: {file_hash}")
+            result = transcription_cache[file_hash]
+            active_tasks[task_id]["status"] = TaskStatus.COMPLETE
+            active_tasks[task_id]["result"] = result
             
-            # Format response based on requested format
-            if response_format == 'text':
-                return cached_result['text']
-                
-            elif response_format == 'srt':
-                ret = ""
-                for seg in cached_result['segments']:
-                    td_s = timedelta(milliseconds=seg["start"]*1000)
-                    td_e = timedelta(milliseconds=seg["end"]*1000)
-                    
-                    t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
-                    t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
-                    
-                    ret += '{}\n{} --> {}\n{}\n\n'.format(seg["id"], t_s, t_e, seg["text"])
-                ret += '\n'
-                return ret
-                
-            elif response_format == 'vtt':
-                ret = "WEBVTT\n\n"
-                for seg in cached_result['segments']:
-                    td_s = timedelta(milliseconds=seg["start"]*1000)
-                    td_e = timedelta(milliseconds=seg["end"]*1000)
-                    
-                    t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
-                    t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
-                    
-                    ret += "{} --> {}\n{}\n\n".format(t_s, t_e, seg["text"])
-                return ret
-                
-            elif response_format == 'verbose_json':
-                cached_result.setdefault('task', WHISPER_DEFAULT_SETTINGS['task'])
-                if not cached_result.get('segments') or len(cached_result['segments']) == 0:
-                    cached_result['segments'] = [{'start': 0.0, 'end': 0.0, 'text': ''}]
-                    cached_result.setdefault('duration', 0.0)
-                    logger.warning(f"Empty segments array for cached transcription: {file_hash}")
-                else:
-                    cached_result.setdefault('duration', cached_result['segments'][-1]['end'])
-                if cached_result['language'] == 'ja':
-                    cached_result['language'] = 'japanese'
-                return cached_result
-                
-            else:  # json (default)
-                return {'text': cached_result['text']}
-
-        # Generate task ID
-        task_id = generate_task_id()
-        active_tasks[task_id] = {"status": "pending", "result": None}
-        logger.info(f"New transcription task created with ID: {task_id}")
+            # Format and return response
+            formatted_response = format_response(result, req.response_format)
+            
+            # If response is a string, return as PlainText for proper content-type
+            if isinstance(formatted_response, str):
+                return Response(content=formatted_response, media_type="text/plain")
+            return formatted_response
         
         # Apply transcription settings
         settings = WHISPER_DEFAULT_SETTINGS.copy()
-        settings['temperature'] = temperature
-        if language is not None:
-            settings['language'] = language
-        if prompt is not None:
-            settings['initial_prompt'] = prompt
+        settings['temperature'] = req.temperature
+        settings['temperature_increment_on_fallback'] = 0.2
+        if req.language is not None:
+            settings['language'] = req.language
+        if req.prompt is not None:
+            settings['initial_prompt'] = req.prompt
         
-        # Check if webhook is provided
+        # For async requests with webhook, process in background
         if webhook_url:
-            webhook_task = asyncio.create_task(
-                async_transcribe(temp_file_path, **settings)
-            )
-            
-            # Register webhook
-            webhooks[task_id] = {
-                "url": webhook_url,
-                "secret": webhook_secret
-            }
-            
-            # Process transcription asynchronously
-            def process_transcription():
+            # Create task for background processing
+            async def process_in_background():
                 try:
-                    result = asyncio.run(webhook_task)
-                    transcription_cache[file_hash] = result
+                    # Ensure model is loaded
+                    await load_whisper_model()
                     
-                    # Update task status
-                    active_tasks[task_id]["status"] = "complete"
-                    active_tasks[task_id]["result"] = result
+                    # Process transcription
+                    result = await async_transcribe(temp_file_path, task_id, **settings)
+                    
+                    # Cache result
+                    transcription_cache[file_hash] = result
                     
                     # Send webhook notification
                     send_webhook_notification(task_id)
                 except Exception as e:
-                    logger.error(f"Async transcription failed: {str(e)}")
-                    active_tasks[task_id]["status"] = "failed"
+                    logger.error(f"Background transcription failed: {str(e)}", exc_info=True)
+                    active_tasks[task_id]["status"] = TaskStatus.FAILED
                     active_tasks[task_id]["error"] = str(e)
                     
                     # Send failure notification
                     send_webhook_notification(task_id)
+                finally:
+                    # Cleanup temp file
+                    if os.path.exists(temp_file_path):
+                        try:
+                            os.unlink(temp_file_path)
+                        except Exception as e:
+                            logger.error(f"Failed to remove temp file: {str(e)}")
             
-            # Run transcription in background thread
-            worker_pool.submit(process_transcription)
+            # Start background task
+            asyncio.create_task(process_in_background())
             
             return {
-                "message": "Transcription started",
                 "task_id": task_id,
                 "status": "processing",
-                "webhook_registered": True
+                "message": "Transcription started - check status or await webhook notification"
             }
         
-        # Perform synchronous transcription if no webhook
-        result = transcribe(temp_file_path, task_id, **settings)
+        # For synchronous requests, process immediately
+        await load_whisper_model()
+        result = await async_transcribe(temp_file_path, task_id, **settings)
+        
+        # Cache result for future use
         transcription_cache[file_hash] = result
         
-        # Format response based on requested format
-        if response_format == 'text':
-            return result['text']
-            
-        elif response_format == 'srt':
-            ret = ""
-            for seg in result['segments']:
-                td_s = timedelta(milliseconds=seg["start"]*1000)
-                td_e = timedelta(milliseconds=seg["end"]*1000)
-                
-                t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
-                t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
-                
-                ret += '{}\n{} --> {}\n{}\n\n'.format(seg["id"], t_s, t_e, seg["text"])
-            ret += '\n'
-            return ret
-            
-        elif response_format == 'vtt':
-            ret = "WEBVTT\n\n"
-            for seg in result['segments']:
-                td_s = timedelta(milliseconds=seg["start"]*1000)
-                td_e = timedelta(milliseconds=seg["end"]*1000)
-                
-                t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
-                t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
-                
-                ret += "{} --> {}\n{}\n\n".format(t_s, t_e, seg["text"])
-            return ret
-            
-        elif response_format == 'verbose_json':
-            result.setdefault('task', WHISPER_DEFAULT_SETTINGS['task'])
-            if not result.get('segments') or len(result['segments']) == 0:
-                result['segments'] = [{'start': 0.0, 'end': 0.0, 'text': ''}]
-                result.setdefault('duration', 0.0)
-                logger.warning(f"Empty segments array for new transcription: {file_hash}")
-            else:
-                result.setdefault('duration', result['segments'][-1]['end'])
-            if result['language'] == 'ja':
-                result['language'] = 'japanese'
-            return result
-            
-        else:  # json (default)
-            return {'text': result['text']}
-            
+        # Format and return response
+        formatted_response = format_response(result, req.response_format)
+        
+        # If response is a string, return as PlainText for proper content-type
+        if isinstance(formatted_response, str):
+            return Response(content=formatted_response, media_type="text/plain")
+        return formatted_response
+        
     except Exception as e:
-        logger.error(f"Error processing transcription: {str(e)}", exc_info=True)
+        logger.error(f"Transcription request failed: {str(e)}", exc_info=True)
+        
+        # Update task status if it was a background task
+        if task_id in active_tasks:
+            active_tasks[task_id]["status"] = TaskStatus.FAILED
+            active_tasks[task_id]["error"] = str(e)
+            
+            # Send webhook notification if registered
+            if task_id in webhooks:
+                send_webhook_notification(task_id)
+        
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing transcription: {str(e)}"
+            detail=f"Transcription failed: {str(e)}"
         )
+        
     finally:
-        # Clean up temporary file
+        # Clean up temporary file if it exists
         if temp_file_path and os.path.exists(temp_file_path):
-            logger.debug(f"Checking if temporary file exists: {os.path.exists(temp_file_path)}")
-            if os.path.exists(temp_file_path):
-                logger.debug(f"Temporary file found: {temp_file_path}")
-                try:
-                    os.remove(temp_file_path)
-                    logger.debug(f"Temporary file removed: {temp_file_path}")
-                except Exception as e:
-                    logger.error(f"Failed to remove temporary file: {temp_file_path}, error: {str(e)}")
-            else:
-                logger.debug(f"Temporary file not found: {temp_file_path}")
-
-@app.exception_handler(RateLimitExceeded)
-async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    """
-    Custom rate limit exceeded handler
-    """
-    return JSONResponse(
-        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-        content={"error": "Rate limit exceeded", "retry_after": exc.retry_after},
-    )
+            try:
+                os.unlink(temp_file_path)
+                logger.debug(f"Removed temporary file: {temp_file_path}")
+            except Exception as e:
+                logger.error(f"Failed to remove temporary file: {str(e)}")
 
 def main():
-    # Print the API key to console
-    logger.info(f"API Key: {API_KEY}")
-    
-    # Initialize rate limiter
-    limiter.redis = redis_client
-    # Validate PORT
+    """Entry point for running the server directly"""
+    # Validate configuration
     try:
-        port = int(PORT)
-        if port < 1024 or port > 65535:
-            raise ValueError(f"Port must be between 1024 and 65535, got {port}")
-    except ValueError as e:
-        logger.error(f"Invalid PORT value: {PORT} - {str(e)}")
-        raise SystemExit(1)
+        # Set up metrics logging thread
+        log_system_metrics()
         
-    logger.info(f"Starting server on {HOST}:{port}")
-    
-    # Start the server
-    uvicorn.run(
-        "server:app", 
-        host=HOST, 
-        port=port, 
-        log_level="debug" if DEBUG else "info"
-    )
+        # Initialize libraries
+        mimetypes.init()
+        
+        # Start the server
+        uvicorn.run(
+            "server:app", 
+            host=config.HOST, 
+            port=config.PORT,
+            log_level="debug" if config.DEBUG else "info"
+        )
+    except Exception as e:
+        logger.error(f"Failed to start server: {str(e)}", exc_info=True)
+        raise SystemExit(1)
 
 if __name__ == "__main__":
     main()
