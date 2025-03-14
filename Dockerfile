@@ -37,7 +37,8 @@ COPY . /app
 
 # Environment variables
 ENV WHISPER_MODEL=${WHISPER_MODEL:-base}
-ENV API_KEY=${API_KEY:?ERR_API_KEY_NOT_SET}
+ARG API_KEY
+ENV API_KEY=${API_KEY:-default_api_key}
 ENV PORT=${PORT:-8088}
 ENV HOST=${HOST:-0.0.0.0}
 ENV UPLOAD_DIR=${UPLOAD_DIR:-/app/uploads}

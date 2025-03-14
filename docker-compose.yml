@@ -8,7 +8,7 @@ services:
       - .env
     environment:
       WHISPER_MODEL: ${WHISPER_MODEL:-base}  # Use base model for 4GB RAM
-      API_KEY: ${API_KEY:?ERR_API_KEY_NOT_SET}
+      API_KEY: ${API_KEY:-default_api_key}
       PORT: ${PORT:-8088}
       UPLOAD_DIR: ${UPLOAD_DIR:-/app/uploads}
       DEBUG: ${DEBUG:-false}
