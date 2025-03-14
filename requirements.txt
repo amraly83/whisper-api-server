@@ -6,3 +6,4 @@ torchaudio
 python-multipart
 numpy
 python-dotenv
+psutil
