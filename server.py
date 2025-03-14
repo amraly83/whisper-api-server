@@ -410,6 +410,7 @@ webhooks = {}  # {task_id: {"url": webhook_url, "secret": webhook_secret}}
 @app.post('/v1/webhooks')
 @limiter.limit(RATE_LIMITS[1])  # Apply less strict rate limit for webhooks
 async def register_webhook(
+    request: Request,
     webhook: Webhook,
     task_id: str = Query(...),
     api_key: str = Depends(verify_api_key)
