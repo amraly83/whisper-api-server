@@ -87,7 +87,7 @@ class AppConfig:
             raise ValueError("API_KEY environment variable is required")
         
         try:
-            self.PORT = int(os.environ.get('PORT', '8000'))
+            self.PORT = int(os.environ.get('PORT', '8088'))
             if self.PORT < 1024 or self.PORT > 65535:
                 raise ValueError(f"Invalid port number: {self.PORT}")
         except ValueError as e:
