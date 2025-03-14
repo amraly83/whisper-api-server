@@ -273,6 +273,7 @@ async def transcriptions(
         )
 
     # Create temporary file and calculate hash
+    temp_file_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as temp_file:
             # Copy uploaded file to temporary file
@@ -347,24 +348,49 @@ async def transcriptions(
         if prompt is not None:
             settings['initial_prompt'] = prompt
         
-        # Perform transcription asynchronously
-        future = worker_pool.submit(transcribe, temp_file_path, task_id, **settings)
-
-        def callback(fut):
-            nonlocal file_hash
-            if fut.exception():
-                logger.error(f"Transcription task {task_id} failed: {fut.exception()}")
-                active_tasks[task_id]["status"] = "error"
-                active_tasks[task_id]["result"] = str(fut.exception())
-            else:
-                result = fut.result()
-                transcription_cache[file_hash] = result
-                logger.info(f"Transcription for task {task_id} completed and cached")
-
-        future.add_done_callback(callback)
+        # Perform transcription synchronously
+        result = transcribe(temp_file_path, **settings)
+        transcription_cache[file_hash] = result
+        logger.info(f"Transcription for file {file_hash} completed and cached")
         
-        # Return task ID for status checking
-        return {"task_id": task_id, "status": "pending"}
+        # Format response based on requested format
+        if response_format == 'text':
+            return result['text']
+            
+        elif response_format == 'srt':
+            ret = ""
+            for seg in result['segments']:
+                td_s = timedelta(milliseconds=seg["start"]*1000)
+                td_e = timedelta(milliseconds=seg["end"]*1000)
+                
+                t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
+                t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
+                
+                ret += '{}\n{} --> {}\n{}\n\n'.format(seg["id"], t_s, t_e, seg["text"])
+            ret += '\n'
+            return ret
+            
+        elif response_format == 'vtt':
+            ret = "WEBVTT\n\n"
+            for seg in result['segments']:
+                td_s = timedelta(milliseconds=seg["start"]*1000)
+                td_e = timedelta(milliseconds=seg["end"]*1000)
+                
+                t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
+                t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
+                
+                ret += "{} --> {}\n{}\n\n".format(t_s, t_e, seg["text"])
+            return ret
+            
+        elif response_format == 'verbose_json':
+            result.setdefault('task', WHISPER_DEFAULT_SETTINGS['task'])
+            result.setdefault('duration', result['segments'][-1]['end'])
+            if result['language'] == 'ja':
+                result['language'] = 'japanese'
+            return result
+            
+        else:  # json (default)
+            return {'text': result['text']}
             
     except Exception as e:
         logger.error(f"Error processing transcription: {str(e)}", exc_info=True)
@@ -374,7 +400,7 @@ async def transcriptions(
         )
     finally:
         # Clean up temporary file
-        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+        if temp_file_path and os.path.exists(temp_file_path):
             logger.debug(f"Checking if temporary file exists: {os.path.exists(temp_file_path)}")
             if os.path.exists(temp_file_path):
                 logger.debug(f"Temporary file found: {temp_file_path}")
