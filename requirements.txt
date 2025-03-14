@@ -7,3 +7,4 @@ python-multipart
 numpy
 python-dotenv
 psutil
+redis  # For rate limiting and caching

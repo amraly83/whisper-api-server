@@ -2,6 +2,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Form, UploadFile, File, Header, Depends, HTTPException, status, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from redis import Redis
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
@@ -49,6 +53,67 @@ HOST = os.environ.get('HOST', '0.0.0.0')
 UPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/tmp')
 DEBUG = os.environ.get('DEBUG', 'false').lower() == 'true'
 
+# Enhanced logging setup
+class LoggingMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        
+        start_time = time.time()
+        req_body = b""
+        
+        async def receive_wrapper():
+            nonlocal req_body
+            message = await receive()
+            if message["type"] == "http.request":
+                req_body += message.get("body", b"")
+            return message
+        
+        response_status = None
+        res_body = b""
+        
+        async def send_wrapper(message):
+            nonlocal response_status, res_body
+            if message["type"] == "http.response.start":
+                response_status = message["status"]
+            elif message["type"] == "http.response.body":
+                res_body += message.get("body", b"")
+            await send(message)
+        
+        try:
+            await self.app(scope, receive_wrapper, send_wrapper)
+        except Exception as e:
+            logger.error(f"Request failed: {str(e)}", exc_info=True)
+            raise
+        finally:
+            duration = int((time.time() - start_time) * 1000)
+            log_data = {
+                "method": scope["method"],
+                "path": scope["path"],
+                "status_code": response_status,
+                "duration_ms": duration,
+                "request_size": len(req_body),
+                "response_size": len(res_body),
+            }
+            logger.info(f"API Request: {json.dumps(log_data)}")
+            
+            # Log errors separately
+            if response_status and response_status >= 400:
+                error_data = {
+                    "error": {
+                        "status_code": response_status,
+                        "path": scope["path"],
+                        "method": scope["method"],
+                        "response": res_body.decode(errors="ignore"),
+                        "duration_ms": duration
+                    }
+                }
+                logger.error(f"API Error: {json.dumps(error_data)}")
+
 # Setup logging
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -56,13 +121,79 @@ logging.basicConfig(
 )
 logger = logging.getLogger("whisper-api")
 
+# Performance metrics
+performance_metrics = {
+    "total_requests": 0,
+    "success_count": 0,
+    "error_count": 0,
+    "average_response_time": 0,
+    "response_times": []
+}
+
+def update_metrics(status_code: int, duration: float):
+    """Update performance metrics"""
+    performance_metrics["total_requests"] += 1
+    performance_metrics["response_times"].append(duration)
+    performance_metrics["average_response_time"] = sum(performance_metrics["response_times"]) / len(performance_metrics["response_times"])
+    
+    if 200 <= status_code < 400:
+        performance_metrics["success_count"] += 1
+    else:
+        performance_metrics["error_count"] += 1
+
+@app.get("/metrics")
+async def get_metrics(api_key: str = Depends(verify_api_key)):
+    """Get server performance metrics"""
+    current_metrics = performance_metrics.copy()
+    current_metrics["uptime"] = time.time() - app.startup_time
+    current_metrics["average_response_time"] = round(current_metrics["average_response_time"], 2)
+    return current_metrics
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global whisper_model
+    app.startup_time = time.time()
+    
+    # Load the ML model with CPU optimizations
+    logger.info(f"Loading Whisper model: {WHISPER_MODEL}")
+    device = "cpu"
+    logger.info(f"Using device: {device}")
+    
+    # Load model with reduced memory footprint
+    whisper_model = whisper.load_model(
+        WHISPER_MODEL,
+        device=device,
+        in_memory=False,  # Reduce memory usage
+        download_root="/tmp/whisper"  # Cache model files
+    )
+    
+    # Enable CPU optimizations
+    torch.set_num_threads(4)  # Limit CPU threads
+    torch.backends.quantized.engine = 'qnnpack'  # Enable quantization
+    logger.info("Whisper model loaded successfully")
+
+    yield
+
+    # Clean up the ML models and release the resources
+    logger.info("Shutting down, releasing resources")
+    del whisper_model
+    whisper_model = None
+
+
 # Security
 security = HTTPBearer()
+
+# Rate limiting setup
+redis_client = Redis(host='redis', port=6379, db=0, decode_responses=True)
+limiter = Limiter(key_func=get_remote_address, storage_uri="redis://redis:6379")
 
 # Global model and async processing
 whisper_model = None
 task_queue = Queue()
 worker_pool = ThreadPoolExecutor(max_workers=4)
+
+# Rate limit configuration (adjust based on server capacity)
+RATE_LIMITS = ["10/minute", "50/hour"]  # Max 10 requests per minute, 50 per hour
 
 # Task tracking and caching
 active_tasks = {}  # {task_id: {"status": "pending|processing|complete", "result": None}}
@@ -116,6 +247,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# Add logging middleware
+app.add_middleware(LoggingMiddleware)
 
 # Add CORS middleware
 app.add_middleware(
@@ -222,8 +356,15 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
     return combined_transcript
 
 @app.get("/v1/audio/transcriptions/{task_id}")
-async def get_transcription_status(task_id: str, api_key: str = Depends(verify_api_key)):
-    """Get the status or result of a transcription task"""
+async def get_transcription_status(
+    task_id: str, 
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Get the status or result of a transcription task with pagination
+    """
     if task_id not in active_tasks:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -231,10 +372,27 @@ async def get_transcription_status(task_id: str, api_key: str = Depends(verify_a
         )
 
     task = active_tasks[task_id]
-    if task["status"] == "complete":
-        return task["result"]
-    else:
+    if task["status"] != "complete":
         return {"status": task["status"]}
+    
+    # Paginate results
+    result = task["result"]
+    total_segments = len(result['segments'])
+    start_idx = (page - 1) * page_size
+    end_idx = start_idx + page_size
+    
+    paginated_segments = result['segments'][start_idx:end_idx]
+    has_more = end_idx < total_segments
+    
+    return {
+        "text": result['text'],
+        "language": result['language'],
+        "total_segments": total_segments,
+        "page": page,
+        "page_size": page_size,
+        "has_more": has_more,
+        "segments": paginated_segments
+    }
 
 @app.get("/health")
 async def health_check():
@@ -242,7 +400,65 @@ async def health_check():
     return {"status": "healthy"}
 
 
+# Webhook model
+class Webhook(BaseModel):
+    url: HttpUrl
+    secret: Optional[str] = None
+
+webhooks = {}  # {task_id: {"url": webhook_url, "secret": webhook_secret}}
+
+@app.post('/v1/webhooks')
+@limiter.limit(RATE_LIMITS[1])  # Apply less strict rate limit for webhooks
+async def register_webhook(
+    webhook: Webhook,
+    task_id: str = Query(...),
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Register a webhook for transcription completion notifications
+    """
+    if task_id not in active_tasks:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task ID not found: {task_id}"
+        )
+    
+    webhooks[task_id] = {
+        "url": webhook.url,
+        "secret": webhook.secret
+    }
+    
+    return {"message": "Webhook registered successfully"}
+
+def send_webhook_notification(task_id: str):
+    """Send webhook notification in background"""
+    if task_id not in webhooks:
+        return
+    
+    webhook = webhooks[task_id]
+    task = active_tasks[task_id]
+    
+    headers = {}
+    if webhook['secret']:
+        signature = hmac.new(
+            webhook['secret'].encode(),
+            json.dumps(task).encode(),
+            hashlib.sha256
+        ).hexdigest()
+        headers['X-Webhook-Signature'] = signature
+    
+    try:
+        requests.post(
+            webhook['url'],
+            json=task,
+            headers=headers,
+            timeout=5
+        )
+    except Exception as e:
+        logger.error(f"Webhook delivery failed for task {task_id}: {str(e)}")
+
 @app.post('/v1/audio/transcriptions')
+@limiter.limit(RATE_LIMITS[0])  # Apply rate limiting to endpoint
 async def transcriptions(
     model: str = Form(...),
     file: UploadFile = File(...),
@@ -250,9 +466,18 @@ async def transcriptions(
     language: Optional[str] = Form(None),
     prompt: Optional[str] = Form(None),
     temperature: Optional[float] = Form(None),
+    webhook_url: Optional[str] = Form(None),
+    webhook_secret: Optional[str] = Form(None),
     api_key: str = Depends(verify_api_key)
 ):
     logger.info(f"Received transcription request for file: {file.filename}")
+    
+    # Check remaining rate limit
+    current_limit = limiter.current_limit
+    remaining = current_limit.get_retry_after() if current_limit else None
+    logger.debug(f"Rate limit remaining: {remaining}")
+    
+    # Existing code...
     
     # Validate model
     if model != "whisper-1":
@@ -355,10 +580,51 @@ async def transcriptions(
         if prompt is not None:
             settings['initial_prompt'] = prompt
         
-        # Perform transcription synchronously
+        # Check if webhook is provided
+        if webhook_url:
+            webhook_task = asyncio.create_task(
+                async_transcribe(temp_file_path, **settings)
+            )
+            
+            # Register webhook
+            webhooks[task_id] = {
+                "url": webhook_url,
+                "secret": webhook_secret
+            }
+            
+            # Process transcription asynchronously
+            def process_transcription():
+                try:
+                    result = asyncio.run(webhook_task)
+                    transcription_cache[file_hash] = result
+                    
+                    # Update task status
+                    active_tasks[task_id]["status"] = "complete"
+                    active_tasks[task_id]["result"] = result
+                    
+                    # Send webhook notification
+                    send_webhook_notification(task_id)
+                except Exception as e:
+                    logger.error(f"Async transcription failed: {str(e)}")
+                    active_tasks[task_id]["status"] = "failed"
+                    active_tasks[task_id]["error"] = str(e)
+                    
+                    # Send failure notification
+                    send_webhook_notification(task_id)
+            
+            # Run transcription in background thread
+            worker_pool.submit(process_transcription)
+            
+            return {
+                "message": "Transcription started",
+                "task_id": task_id,
+                "status": "processing",
+                "webhook_registered": True
+            }
+        
+        # Perform synchronous transcription if no webhook
         result = transcribe(temp_file_path, task_id, **settings)
         transcription_cache[file_hash] = result
-        logger.info(f"Transcription for file {file_hash} completed and cached")
         
         # Format response based on requested format
         if response_format == 'text':
@@ -419,10 +685,22 @@ async def transcriptions(
             else:
                 logger.debug(f"Temporary file not found: {temp_file_path}")
 
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """
+    Custom rate limit exceeded handler
+    """
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"error": "Rate limit exceeded", "retry_after": exc.retry_after},
+    )
+
 def main():
     # Print the API key to console
     logger.info(f"API Key: {API_KEY}")
     
+    # Initialize rate limiter
+    limiter.redis = redis_client
     # Validate PORT
     try:
         port = int(PORT)

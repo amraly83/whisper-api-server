@@ -1,11 +1,24 @@
-# Use official Python slim image
-FROM python:3.9-slim
+# Stage 1: Build
+FROM python:3.9-slim AS builder
 
-# Install system dependencies including curl
+# Install build dependencies
 RUN apt-get update && apt-get install -y \
-    ffmpeg \
     build-essential \
     git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first to leverage Docker cache
+COPY requirements.txt .
+
+# Install dependencies without cache
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Stage 2: Final
+FROM python:3.9-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -18,8 +31,9 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY . .
+# Copy only necessary files from builder stage
+COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
+COPY . /app
 
 # Environment variables
 ENV WHISPER_MODEL=base
@@ -39,5 +53,8 @@ EXPOSE ${PORT}
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD curl -f http://localhost:8088/health || exit 1
 
-# Start command
-CMD uvicorn server:app --host 0.0.0.0 --port $PORT
+# Optimize Uvicorn workers based on memory constraints
+ENV UVICORN_WORKERS=2
+
+# Start command with optimized worker configuration
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "$PORT", "--workers", "$UVICORN_WORKERS"]

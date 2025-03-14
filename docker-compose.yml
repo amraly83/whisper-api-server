@@ -12,9 +12,27 @@ services:
       - DEBUG=false
     ports:
       - "8088:8088"
+    deploy:
+      resources:
+        limits:
+          memory: 3g # Limit to 3GB out of 4GB available
+        reservations:
+          memory: 512m
     volumes:
       - uploads:/app/uploads
     restart: unless-stopped
 
+  redis:
+    image: "redis:alpine"
+    container_name: "whisper-api-redis"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512mb
+    volumes:
+      - redis_data:/data
+
 volumes:
   uploads:
+  redis_data:
