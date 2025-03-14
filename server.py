@@ -368,8 +368,16 @@ async def transcriptions(
     finally:
         # Clean up temporary file
         if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-            logger.debug(f"Temporary file removed: {temp_file_path}")
+            logger.debug(f"Checking if temporary file exists: {os.path.exists(temp_file_path)}")
+            if os.path.exists(temp_file_path):
+                logger.debug(f"Temporary file found: {temp_file_path}")
+                try:
+                    os.remove(temp_file_path)
+                    logger.debug(f"Temporary file removed: {temp_file_path}")
+                except Exception as e:
+                    logger.error(f"Failed to remove temporary file: {temp_file_path}, error: {str(e)}")
+            else:
+                logger.debug(f"Temporary file not found: {temp_file_path}")
 
 def main():
     # Print the API key to console
