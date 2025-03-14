@@ -459,7 +459,7 @@ def send_webhook_notification(task_id: str):
         logger.error(f"Webhook delivery failed for task {task_id}: {str(e)}")
 
 @app.post('/v1/audio/transcriptions')
-@limiter.limit(RATE_LIMITS.split(',')[0])  # Apply rate limiting to endpoint
+@limiter.limit(RATE_LIMITS[0])  # Apply rate limiting to endpoint
 async def transcriptions(
     model: str = Form(...),
     file: UploadFile = File(...),
