@@ -22,7 +22,7 @@ COPY . .
 # Environment variables
 ENV WHISPER_MODEL=base
 ENV API_KEY=please-set-in-docker-compose
-ENV PORT=8000
+ENV PORT=8088
 ENV HOST=0.0.0.0
 ENV UPLOAD_DIR=/app/uploads
 ENV DEBUG=false
@@ -34,4 +34,4 @@ RUN mkdir -p ${UPLOAD_DIR}
 EXPOSE ${PORT}
 
 # Start command
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "${PORT}"]
