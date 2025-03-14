@@ -5,6 +5,7 @@ FROM python:3.9-slim
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     build-essential \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -34,4 +35,4 @@ RUN mkdir -p ${UPLOAD_DIR}
 EXPOSE ${PORT}
 
 # Start command
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "${PORT}"]
+CMD uvicorn server:app --host 0.0.0.0 --port $PORT

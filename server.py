@@ -26,7 +26,7 @@ import tempfile
 # Configuration
 WHISPER_MODEL = os.environ.get('WHISPER_MODEL', 'tiny')
 API_KEY = os.environ.get('API_KEY', secrets.token_hex(16))  # Generate a random API key if not provided
-PORT = int(os.environ.get('PORT', 8000))
+PORT = int(os.environ.get('PORT', 8088))
 HOST = os.environ.get('HOST', '0.0.0.0')
 UPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/tmp')
 DEBUG = os.environ.get('DEBUG', 'false').lower() == 'true'
@@ -276,13 +276,23 @@ async def transcriptions(
 def main():
     # Print the API key to console
     logger.info(f"API Key: {API_KEY}")
-    logger.info(f"Starting server on {HOST}:{PORT}")
+    
+    # Validate PORT
+    try:
+        port = int(PORT)
+        if port < 1024 or port > 65535:
+            raise ValueError(f"Port must be between 1024 and 65535, got {port}")
+    except ValueError as e:
+        logger.error(f"Invalid PORT value: {PORT} - {str(e)}")
+        raise SystemExit(1)
+        
+    logger.info(f"Starting server on {HOST}:{port}")
     
     # Start the server
     uvicorn.run(
-        "main:app", 
+        "server:app", 
         host=HOST, 
-        port=PORT, 
+        port=port, 
         log_level="debug" if DEBUG else "info"
     )
 
