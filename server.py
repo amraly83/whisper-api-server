@@ -235,6 +235,12 @@ async def get_transcription_status(task_id: str, api_key: str = Depends(verify_a
     else:
         return {"status": task["status"]}
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy"}
+
+
 @app.post('/v1/audio/transcriptions')
 async def transcriptions(
     model: str = Form(...),

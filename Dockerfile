@@ -34,5 +34,9 @@ RUN mkdir -p ${UPLOAD_DIR}
 # Expose port
 EXPOSE ${PORT}
 
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:8088/health || exit 1
+
 # Start command
 CMD uvicorn server:app --host 0.0.0.0 --port $PORT
