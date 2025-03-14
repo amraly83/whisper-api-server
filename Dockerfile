@@ -36,12 +36,22 @@ COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python
 COPY . /app
 
 # Environment variables
-ENV WHISPER_MODEL=base
-ENV API_KEY=please-set-in-docker-compose
-ENV PORT=8088
-ENV HOST=0.0.0.0
-ENV UPLOAD_DIR=/app/uploads
-ENV DEBUG=false
+ENV WHISPER_MODEL=${WHISPER_MODEL:-base}
+ENV API_KEY=${API_KEY:?ERR_API_KEY_NOT_SET}
+ENV PORT=${PORT:-8088}
+ENV HOST=${HOST:-0.0.0.0}
+ENV UPLOAD_DIR=${UPLOAD_DIR:-/app/uploads}
+ENV DEBUG=${DEBUG:-false}
+
+# Security settings
+# Maximum file size (default: 50MB)
+ENV MAX_FILE_SIZE=${MAX_FILE_SIZE:-52428800}
+
+# Allowed CORS origins (default: *)
+ENV ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-*}
+
+# Rate limiting configuration (default: 10/minute,50/hour)
+ENV RATE_LIMITS=${RATE_LIMITS:-"10/minute,50/hour"}
 
 # Create upload directory
 RUN mkdir -p ${UPLOAD_DIR}

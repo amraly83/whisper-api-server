@@ -4,12 +4,17 @@ services:
   whisper-api:
     build: .
     container_name: whisper-api
+    env_file:
+      - .env
     environment:
-      - WHISPER_MODEL=base  # Use base model for 4GB RAM
-      - API_KEY=${API_KEY:?ERR_API_KEY_NOT_SET}
-      - PORT=8088
-      - UPLOAD_DIR=/app/uploads
-      - DEBUG=false
+      WHISPER_MODEL: ${WHISPER_MODEL:-base}  # Use base model for 4GB RAM
+      API_KEY: ${API_KEY:?ERR_API_KEY_NOT_SET}
+      PORT: ${PORT:-8088}
+      UPLOAD_DIR: ${UPLOAD_DIR:-/app/uploads}
+      DEBUG: ${DEBUG:-false}
+      MAX_FILE_SIZE: ${MAX_FILE_SIZE:-52428800}  # 50MB default
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      RATE_LIMITS: ${RATE_LIMITS:-"10/minute,50/hour"}
     ports:
       - "8088:8088"
     deploy:

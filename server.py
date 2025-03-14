@@ -1,8 +1,8 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, Form, UploadFile, File, Header, Depends, HTTPException, status, BackgroundTasks
+from fastapi import FastAPI, Request, Form, UploadFile, File, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from redis import Redis
@@ -15,25 +15,29 @@ import os
 import shutil
 import logging
 from pathlib import Path
-from typing import Any, List, Union, Optional
+from typing import Optional
 
 from datetime import timedelta
-import secrets
 import time
 import hmac  # For webhook signature verification
 import requests  # For webhook delivery
 from pydantic import BaseModel, HttpUrl  # For request validation
 from fastapi import Query  # For query parameter validation
 
-import numpy as np
 import whisper
 import torch
 
 import uvicorn
 import json
-import base64
 import tempfile
 import hashlib
+
+# Setup basic logging early
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("whisper-api")
 
 # File hashing
 def calculate_file_hash(file_path: str) -> str:
@@ -49,13 +53,34 @@ async def async_transcribe(audio_path: str, **whisper_args):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(worker_pool, transcribe, audio_path, **whisper_args)
 
-# Configuration
+# Enhanced Configuration
 WHISPER_MODEL = os.environ.get('WHISPER_MODEL', 'small')
-API_KEY = os.environ.get('API_KEY', secrets.token_hex(16))  # Generate a random API key if not provided
-PORT = int(os.environ.get('PORT', 8088))
+API_KEY = os.environ.get('API_KEY')
+if not API_KEY:
+    print("[ERROR] API_KEY environment variable is required")
+    raise SystemExit("API_KEY environment variable is required")
+
+PORT = os.environ.get('PORT', '8000')
+try:
+    PORT = int(PORT)
+    if PORT < 1024 or PORT > 65535:
+        raise ValueError(f"Invalid port number: {PORT}")
+except ValueError as e:
+    print(f"[ERROR] Invalid PORT configuration: {e}")
+    raise SystemExit(f"Invalid PORT configuration: {e}")
+
 HOST = os.environ.get('HOST', '0.0.0.0')
-UPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/tmp')
+UPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/tmp/uploads')
+MAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE', 50 * 1024 * 1024))  # 50MB default
+os.makedirs(UPLOAD_DIR, exist_ok=True)  # Ensure upload directory exists
+
 DEBUG = os.environ.get('DEBUG', 'false').lower() == 'true'
+
+# Additional security settings
+MAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE', 50 * 1024 * 1024))  # 50MB default
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '*').split(',')
+RATE_LIMITS = os.environ.get('RATE_LIMITS', "10/minute,50/hour").split(',')
+
 
 # Enhanced logging setup
 class LoggingMiddleware:
@@ -242,7 +267,7 @@ app.add_middleware(LoggingMiddleware)
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
@@ -263,9 +288,10 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
 
     # Set configs & transcribe
     if whisper_args["temperature_increment_on_fallback"] is not None:
-        whisper_args["temperature"] = tuple(
-            np.arange(whisper_args["temperature"], 1.0 + 1e-6, whisper_args["temperature_increment_on_fallback"])
-        )
+            whisper_args["temperature"] = [
+                whisper_args["temperature"] + i * whisper_args["temperature_increment_on_fallback"]
+                for i in range(int((1.0 - whisper_args["temperature"]) / whisper_args["temperature_increment_on_fallback"]) + 1)
+            ]
     else:
         whisper_args["temperature"] = [whisper_args["temperature"]]
 
@@ -432,7 +458,7 @@ def send_webhook_notification(task_id: str):
         logger.error(f"Webhook delivery failed for task {task_id}: {str(e)}")
 
 @app.post('/v1/audio/transcriptions')
-@limiter.limit(RATE_LIMITS[0])  # Apply rate limiting to endpoint
+@limiter.limit(RATE_LIMITS.split(',')[0])  # Apply rate limiting to endpoint
 async def transcriptions(
     model: str = Form(...),
     file: UploadFile = File(...),
@@ -444,6 +470,13 @@ async def transcriptions(
     webhook_secret: Optional[str] = Form(None),
     api_key: str = Depends(verify_api_key)
 ):
+    # Check file size
+    if file.size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE} bytes"
+        )
+        
     logger.info(f"Received transcription request for file: {file.filename}")
     
     # Check remaining rate limit
