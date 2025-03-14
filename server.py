@@ -311,60 +311,46 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
     # Update task status
     active_tasks[task_id]["status"] = "processing"
     
-    # Process audio in optimized chunks
-    chunk_size = 15  # Reduced chunk size for better parallelism
-    audio = whisper.load_audio(audio_path)
-    total_duration = len(audio) / whisper.audio.SAMPLE_RATE
-    transcripts = []
-    
-    def process_chunk(start: int, end: int):
-        """Process individual audio chunk"""
-        logger.debug(f"Processing chunk {start}-{end} seconds")
-        chunk_audio = audio[int(start * whisper.audio.SAMPLE_RATE):int(end * whisper.audio.SAMPLE_RATE)]
+    # Transcribe entire file with memory optimization
+    def transcribe_file():
+        logger.info("Starting transcription process")
         try:
-            return whisper_model.transcribe(chunk_audio, **whisper_args)
+            # Load audio in streaming mode
+            audio = whisper.load_audio(audio_path)
+            
+            # Use generator to process in manageable segments
+            def audio_generator():
+                segment_size = 30 * whisper.audio.SAMPLE_RATE  # 30 seconds
+                for i in range(0, len(audio), segment_size):
+                    yield audio[i:i+segment_size]
+                del audio
+            
+            # Process each segment while maintaining state
+            full_result = {'text': '', 'segments': [], 'language': None}
+            for segment in audio_generator():
+                try:
+                    result = whisper_model.transcribe(segment, **whisper_args)
+                    full_result['text'] += result.get('text', '')
+                    full_result['segments'].extend(result.get('segments', []))
+                    full_result['language'] = full_result['language'] or result.get('language')
+                    
+                    # Manual memory cleanup
+                    del result
+                    gc.collect()
+                except Exception as e:
+                    logger.error(f"Segment processing failed: {str(e)}")
+                    raise
+            
+            return full_result
+        
         finally:
-            del chunk_audio
+            # Final cleanup
+            gc.collect()
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-    # Use global worker pool for parallel processing
-    if worker_pool is None:
-        initialize_worker_pool()
-
-    futures = []
-    for start in range(0, int(total_duration), chunk_size):
-        end = min(start + chunk_size, total_duration)
-        futures.append(worker_pool.submit(process_chunk, start, end))
     
-    # Collect results with error handling
-    transcripts = []
-    for future in as_completed(futures):
-        try:
-            transcripts.append(future.result())
-        except Exception as e:
-            logger.error(f"Chunk processing failed: {str(e)}")
-            raise
-    
-    # Combine transcripts with improved memory management
-    combined_text = []
-    combined_segments = []
-    language = None
-    
-    for transcript in transcripts:
-        combined_text.append(transcript.get('text', ''))
-        combined_segments.extend(transcript.get('segments', []))
-        language = language or transcript.get('language')
-    
-    # Create final result with explicit garbage collection
-    result = {
-        'text': ' '.join([t for t in combined_text if t]),
-        'segments': combined_segments,
-        'language': language
-    }
-    
-    # Explicitly clear intermediate data
-    del combined_text
-    del combined_segments
+    # Run transcription
+    logger.info("Executing transcription")
+    result = transcribe_file()
     gc.collect()
 
     
