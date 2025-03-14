@@ -79,6 +79,7 @@ WHISPER_DEFAULT_SETTINGS = {
     "condition_on_previous_text": True,
     "verbose": False,
     "task": "transcribe",
+    "fp16": False  # Ensure FP16 is disabled
 }
 
 @asynccontextmanager
