@@ -3,7 +3,8 @@ from fastapi import FastAPI, Request, Form, UploadFile, File, Header, Depends, H
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 import asyncio
 
 import os
@@ -15,17 +16,30 @@ from typing import Any, List, Union, Optional
 from datetime import timedelta
 import secrets
 import time
-import multiprocessing
 
 import numpy as np
 import whisper
 import torch
-import warnings
 
 import uvicorn
 import json
 import base64
 import tempfile
+import hashlib
+
+# File hashing
+def calculate_file_hash(file_path: str) -> str:
+    """Calculate SHA256 hash of a file"""
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
+# Async transcription wrapper
+async def async_transcribe(audio_path: str, **whisper_args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(worker_pool, transcribe, audio_path, **whisper_args)
 
 # Configuration
 WHISPER_MODEL = os.environ.get('WHISPER_MODEL', 'small')
@@ -34,9 +48,6 @@ PORT = int(os.environ.get('PORT', 8088))
 HOST = os.environ.get('HOST', '0.0.0.0')
 UPLOAD_DIR = os.environ.get('UPLOAD_DIR', '/tmp')
 DEBUG = os.environ.get('DEBUG', 'false').lower() == 'true'
-NUM_WORKERS = int(os.environ.get('NUM_WORKERS', max(2, multiprocessing.cpu_count() - 1)))
-USE_GPU = os.environ.get('USE_GPU', 'false').lower() == 'true'
-CHUNK_SIZE = int(os.environ.get('CHUNK_SIZE', 30))  # seconds
 
 # Setup logging
 logging.basicConfig(
@@ -45,15 +56,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("whisper-api")
 
-# Filter out unnecessary warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-
 # Security
 security = HTTPBearer()
 
 # Global model and async processing
 whisper_model = None
-worker_pool = None
+task_queue = Queue()
+worker_pool = ThreadPoolExecutor(max_workers=4)
+
+# Task tracking and caching
+active_tasks = {}  # {task_id: {"status": "pending|processing|complete", "result": None}}
+transcription_cache = {}  # {file_hash: transcription_result}
+task_id_counter = 0
 
 # Whisper default settings
 WHISPER_DEFAULT_SETTINGS = {
@@ -69,48 +83,31 @@ WHISPER_DEFAULT_SETTINGS = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global whisper_model, worker_pool
-    # Determine device
-    device = "cuda" if USE_GPU and torch.cuda.is_available() else "cpu"
-    logger.info(f"Loading Whisper model '{WHISPER_MODEL}' on {device}")
+    global whisper_model
+    # Load the ML model with CPU optimizations
+    logger.info(f"Loading Whisper model: {WHISPER_MODEL}")
+    device = "cpu"
+    logger.info(f"Using device: {device}")
     
-    # Optimize based on the device
-    if device == "cpu":
-        # Set torch parameters for CPU optimization
-        torch.set_num_threads(NUM_WORKERS)  # Use available cores
-        torch.set_num_interop_threads(NUM_WORKERS)
-        torch.backends.quantized.engine = 'qnnpack'  # Enable quantization
-    else:
-        # For GPU, make sure to enable CUDA optimizations
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-    
-    # Load model with appropriate optimization flags
+    # Load model with reduced memory footprint
     whisper_model = whisper.load_model(
         WHISPER_MODEL,
         device=device,
-        in_memory=True,         # Keep model in memory for faster inference
+        in_memory=False,  # Reduce memory usage
         download_root="/tmp/whisper"  # Cache model files
     )
     
-    # Create worker pool based on device capabilities
-    if device == "cpu":
-        worker_pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
-        logger.info(f"Created ThreadPoolExecutor with {NUM_WORKERS} workers")
-    else:
-        worker_pool = ThreadPoolExecutor(max_workers=4)  # Fewer workers for GPU to avoid memory issues
-        logger.info(f"Created ThreadPoolExecutor with 4 workers for GPU")
-    
+    # Enable CPU optimizations
+    torch.set_num_threads(4)  # Limit CPU threads
+    torch.backends.quantized.engine = 'qnnpack'  # Enable quantization
     logger.info("Whisper model loaded successfully")
+
     yield
 
-    # Clean up resources
+    # Clean up the ML models and release the resources
     logger.info("Shutting down, releasing resources")
-    worker_pool.shutdown()
     del whisper_model
     whisper_model = None
-    if device == "cuda":
-        torch.cuda.empty_cache()
 
 app = FastAPI(
     title="Whisper API",
@@ -144,138 +141,99 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
     
     return credentials.credentials
 
-# Audio file preprocessing
-def preprocess_audio(audio_path: str):
-    """Load and preprocess audio file for faster transcription"""
-    audio = whisper.load_audio(audio_path)
-    
-    # Normalize audio (improves transcription quality & speed)
-    if not np.isclose(np.max(np.abs(audio)), 1.0):
-        audio = audio / np.max(np.abs(audio))
-    
-    return audio
-
-# Process a single audio chunk
-def process_chunk(args):
-    """Process a single audio chunk"""
-    chunk, whisper_args = args
-    global whisper_model
-    
-    # Process chunk
-    try:
-        with torch.no_grad():  # Disable gradient calculation for inference
-            result = whisper_model.transcribe(chunk, **whisper_args)
-        return result
-    except Exception as e:
-        logger.error(f"Error processing chunk: {str(e)}")
-        return {"text": "", "segments": []}
+# Generate unique task ID
+def generate_task_id() -> str:
+    global task_id_counter
+    task_id_counter += 1
+    return str(task_id_counter)
 
 # Whisper transcription function
-async def transcribe(audio_path: str, **whisper_args):
-    """Transcribe the audio file using whisper with parallel chunk processing"""
-    global whisper_model, worker_pool
-    
-    # Set configs
-    if whisper_args.get("temperature_increment_on_fallback") is not None:
+def transcribe(audio_path: str, task_id: str, **whisper_args):
+    """Transcribe the audio file using whisper with chunked processing"""
+    global whisper_model
+
+    # Set configs & transcribe
+    if whisper_args["temperature_increment_on_fallback"] is not None:
         whisper_args["temperature"] = tuple(
             np.arange(whisper_args["temperature"], 1.0 + 1e-6, whisper_args["temperature_increment_on_fallback"])
         )
     else:
         whisper_args["temperature"] = [whisper_args["temperature"]]
-    
-    if "temperature_increment_on_fallback" in whisper_args:
-        del whisper_args["temperature_increment_on_fallback"]
-    
+
+    del whisper_args["temperature_increment_on_fallback"]
+
     logger.debug(f"Transcribing with args: {whisper_args}")
     start_time = time.time()
+
+    # Update task status
+    active_tasks[task_id]["status"] = "processing"
     
-    # Preprocess audio
-    audio = preprocess_audio(audio_path)
+    # Process audio in chunks to reduce memory usage
+    chunk_size = 30  # seconds
+    audio = whisper.load_audio(audio_path)
     total_duration = len(audio) / whisper.audio.SAMPLE_RATE
+    transcripts = []
     
-    # Process audio in parallel chunks to improve performance
-    chunks = []
-    chunk_size_samples = int(CHUNK_SIZE * whisper.audio.SAMPLE_RATE)
-    
-    # Create chunks
-    for start_sample in range(0, len(audio), chunk_size_samples):
-        end_sample = min(start_sample + chunk_size_samples, len(audio))
-        chunks.append((audio[start_sample:end_sample], whisper_args))
-    
-    logger.debug(f"Split audio into {len(chunks)} chunks of {CHUNK_SIZE} seconds each")
-    
-    # Process chunks in parallel
-    loop = asyncio.get_event_loop()
-    try:
-        # Submit all chunks to the worker pool and gather results
-        chunk_results = await loop.run_in_executor(
-            None,  # Use the default executor
-            lambda: list(worker_pool.map(process_chunk, chunks))
-        )
-    except Exception as e:
-        logger.error(f"Error in parallel processing: {str(e)}", exc_info=True)
-        raise
-    
-    # Combine results
-    combined_text = " ".join([result["text"] for result in chunk_results if result])
-    
-    # Adjust segment timestamps across chunks
-    all_segments = []
-    offset = 0
-    for i, result in enumerate(chunk_results):
-        if not result or "segments" not in result:
-            continue
-            
-        for segment in result["segments"]:
-            segment["start"] += offset
-            segment["end"] += offset
-            all_segments.append(segment)
+    for start in range(0, int(total_duration), chunk_size):
+        end = min(start + chunk_size, total_duration)
+        logger.debug(f"Processing chunk {start}-{end} seconds")
         
-        offset += CHUNK_SIZE
+        # Extract audio chunk
+        start_sample = int(start * whisper.audio.SAMPLE_RATE)
+        end_sample = int(end * whisper.audio.SAMPLE_RATE)
+        audio_chunk = audio[start_sample:end_sample]
+        
+        # Transcribe chunk
+        chunk_transcript = whisper_model.transcribe(
+            audio_chunk,
+            **whisper_args,
+        )
+        transcripts.append(chunk_transcript)
+        
+        # Clear memory
+        del audio_chunk
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
-    # Create final transcript
+    # Combine transcripts
     combined_transcript = {
-        'text': combined_text,
-        'segments': all_segments,
-        'language': chunk_results[0].get('language') if chunk_results and chunk_results[0] else None
+        'text': ' '.join([t['text'] for t in transcripts]),
+        'segments': [seg for t in transcripts for seg in t['segments']],
+        'language': transcripts[0]['language'] if transcripts else None
     }
     
     elapsed_time = time.time() - start_time
-    logger.info(f"Transcription completed in {elapsed_time:.2f} seconds ({total_duration:.2f}s audio)")
+    logger.info(f"Transcription completed in {elapsed_time:.2f} seconds")
     
+    # Log memory usage
+    if torch.cuda.is_available():
+        mem_usage = torch.cuda.memory_allocated() / 1024**2
+        logger.info(f"GPU memory usage: {mem_usage:.2f} MB")
+    else:
+        import psutil
+        process = psutil.Process()
+        mem_usage = process.memory_info().rss / 1024**2
+        logger.info(f"RAM usage: {mem_usage:.2f} MB")
+
+    # Update task status and cache result
+    active_tasks[task_id]["status"] = "complete"
+    active_tasks[task_id]["result"] = combined_transcript
+
     return combined_transcript
 
-@app.get('/')
-async def root():
-    return {
-        "name": "Whisper API",
-        "description": "API for audio transcription using Whisper",
-        "version": "1.0.0",
-        "endpoints": {
-            "/v1/models": "GET - List available models",
-            "/v1/audio/transcriptions": "POST - Transcribe audio files",
-        }
-    }
+@app.get("/v1/audio/transcriptions/{task_id}")
+async def get_transcription_status(task_id: str, api_key: str = Depends(verify_api_key)):
+    """Get the status or result of a transcription task"""
+    if task_id not in active_tasks:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task ID not found: {task_id}"
+        )
 
-@app.get('/v1/models')
-async def v1_models():
-    logger.debug("Returning available models")
-    content = {
-        "object": "list",
-        "data": [
-            {
-                "id": "whisper-1",
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "whisper-api"
-            }
-        ]
-    }
-
-    return JSONResponse(
-        content=content,
-        status_code=200
-    )
+    task = active_tasks[task_id]
+    if task["status"] == "complete":
+        return task["result"]
+    else:
+        return {"status": task["status"]}
 
 @app.post('/v1/audio/transcriptions')
 async def transcriptions(
@@ -313,8 +271,8 @@ async def transcriptions(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid temperature: {temperature}. Must be between 0.0 and 1.0"
         )
-    
-    # Create temporary file
+
+    # Create temporary file and calculate hash
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as temp_file:
             # Copy uploaded file to temporary file
@@ -322,6 +280,57 @@ async def transcriptions(
             temp_file_path = temp_file.name
         
         logger.debug(f"File saved to temporary location: {temp_file_path}")
+        file_hash = calculate_file_hash(temp_file_path)
+        logger.info(f"File hash: {file_hash}")
+
+        # Check if transcription is already cached
+        if file_hash in transcription_cache:
+            logger.info(f"Transcription found in cache for hash: {file_hash}")
+            cached_result = transcription_cache[file_hash]
+            
+            # Format response based on requested format
+            if response_format == 'text':
+                return cached_result['text']
+                
+            elif response_format == 'srt':
+                ret = ""
+                for seg in cached_result['segments']:
+                    td_s = timedelta(milliseconds=seg["start"]*1000)
+                    td_e = timedelta(milliseconds=seg["end"]*1000)
+                    
+                    t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
+                    t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
+                    
+                    ret += '{}\n{} --> {}\n{}\n\n'.format(seg["id"], t_s, t_e, seg["text"])
+                ret += '\n'
+                return ret
+                
+            elif response_format == 'vtt':
+                ret = "WEBVTT\n\n"
+                for seg in cached_result['segments']:
+                    td_s = timedelta(milliseconds=seg["start"]*1000)
+                    td_e = timedelta(milliseconds=seg["end"]*1000)
+                    
+                    t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
+                    t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
+                    
+                    ret += "{} --> {}\n{}\n\n".format(t_s, t_e, seg["text"])
+                return ret
+                
+            elif response_format == 'verbose_json':
+                cached_result.setdefault('task', WHISPER_DEFAULT_SETTINGS['task'])
+                cached_result.setdefault('duration', cached_result['segments'][-1]['end'])
+                if cached_result['language'] == 'ja':
+                    cached_result['language'] = 'japanese'
+                return cached_result
+                
+            else:  # json (default)
+                return {'text': cached_result['text']}
+
+        # Generate task ID
+        task_id = generate_task_id()
+        active_tasks[task_id] = {"status": "pending", "result": None}
+        logger.info(f"New transcription task created with ID: {task_id}")
         
         # Apply transcription settings
         settings = WHISPER_DEFAULT_SETTINGS.copy()
@@ -331,49 +340,25 @@ async def transcriptions(
         if prompt is not None:
             settings['initial_prompt'] = prompt
         
-        # Perform transcription
-        transcript = await transcribe(audio_path=temp_file_path, **settings)
+        # Perform transcription asynchronously
+        future = worker_pool.submit(transcribe, temp_file_path, task_id, **settings)
+
+        def callback(fut):
+            nonlocal file_hash
+            if fut.exception():
+                logger.error(f"Transcription task {task_id} failed: {fut.exception()}")
+                active_tasks[task_id]["status"] = "error"
+                active_tasks[task_id]["result"] = str(fut.exception())
+            else:
+                result = fut.result()
+                transcription_cache[file_hash] = result
+                logger.info(f"Transcription for task {task_id} completed and cached")
+
+        future.add_done_callback(callback)
         
-        # Format response based on requested format
-        if response_format == 'text':
-            return transcript['text']
+        # Return task ID for status checking
+        return {"task_id": task_id, "status": "pending"}
             
-        elif response_format == 'srt':
-            ret = ""
-            for i, seg in enumerate(transcript['segments']):
-                td_s = timedelta(seconds=seg["start"])
-                td_e = timedelta(seconds=seg["end"])
-                
-                t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
-                t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
-                
-                ret += '{}\n{} --> {}\n{}\n\n'.format(i+1, t_s, t_e, seg["text"])
-            ret += '\n'
-            return ret
-            
-        elif response_format == 'vtt':
-            ret = "WEBVTT\n\n"
-            for seg in transcript['segments']:
-                td_s = timedelta(seconds=seg["start"])
-                td_e = timedelta(seconds=seg["end"])
-                
-                t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
-                t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
-                
-                ret += "{} --> {}\n{}\n\n".format(t_s, t_e, seg["text"])
-            return ret
-            
-        elif response_format == 'verbose_json':
-            transcript.setdefault('task', WHISPER_DEFAULT_SETTINGS['task'])
-            if transcript['segments']:
-                transcript.setdefault('duration', transcript['segments'][-1]['end'])
-            if transcript['language'] == 'ja':
-                transcript['language'] = 'japanese'
-            return transcript
-            
-        else:  # json (default)
-            return {'text': transcript['text']}
-        
     except Exception as e:
         logger.error(f"Error processing transcription: {str(e)}", exc_info=True)
         raise HTTPException(
@@ -385,17 +370,6 @@ async def transcriptions(
         if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
             logger.debug(f"Temporary file removed: {temp_file_path}")
-
-# Health check endpoint
-@app.get('/health')
-async def health_check():
-    """Health check endpoint to verify server status"""
-    return {
-        "status": "healthy",
-        "model": WHISPER_MODEL,
-        "device": whisper_model.device if whisper_model else "not loaded",
-        "workers": NUM_WORKERS,
-    }
 
 def main():
     # Print the API key to console
@@ -411,15 +385,13 @@ def main():
         raise SystemExit(1)
         
     logger.info(f"Starting server on {HOST}:{port}")
-    logger.info(f"Using {NUM_WORKERS} workers and {'GPU' if USE_GPU else 'CPU'} for processing")
     
     # Start the server
     uvicorn.run(
         "server:app", 
         host=HOST, 
         port=port, 
-        log_level="debug" if DEBUG else "info",
-        workers=1  # FastAPI instance should use one worker since we handle concurrency internally
+        log_level="debug" if DEBUG else "info"
     )
 
 if __name__ == "__main__":
