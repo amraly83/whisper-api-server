@@ -481,11 +481,6 @@ async def transcriptions(
         
     logger.info(f"Received transcription request for file: {file.filename}")
     
-    # Check remaining rate limit
-    current_limit = limiter.current_limit
-    remaining = current_limit.get_retry_after() if current_limit else None
-    logger.debug(f"Rate limit remaining: {remaining}")
-    
     # Existing code...
     
     # Validate model
