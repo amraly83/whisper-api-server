@@ -349,7 +349,7 @@ async def transcriptions(
             settings['initial_prompt'] = prompt
         
         # Perform transcription synchronously
-        result = transcribe(temp_file_path, **settings)
+        result = transcribe(temp_file_path, task_id, **settings)
         transcription_cache[file_hash] = result
         logger.info(f"Transcription for file {file_hash} completed and cached")
         
