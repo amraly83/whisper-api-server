@@ -321,10 +321,11 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
             
             # Use generator to process in manageable segments
             def audio_generator():
+                audio_data = whisper.load_audio(audio_path)
                 segment_size = 30 * whisper.audio.SAMPLE_RATE  # 30 seconds
-                for i in range(0, len(audio), segment_size):
-                    yield audio[i:i+segment_size]
-                del audio
+                for i in range(0, len(audio_data), segment_size):
+                    yield audio_data[i:i+segment_size]
+                del audio_data
             
             # Process each segment while maintaining state
             full_result = {'text': '', 'segments': [], 'language': None}
@@ -337,6 +338,7 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
                     
                     # Manual memory cleanup
                     del result
+                    import gc
                     gc.collect()
                 except Exception as e:
                     logger.error(f"Segment processing failed: {str(e)}")
@@ -346,6 +348,7 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
         
         finally:
             # Final cleanup
+            import gc
             gc.collect()
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
