@@ -68,4 +68,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 ENV UVICORN_WORKERS=2
 
 # Start command with optimized worker configuration
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "$PORT", "--workers", "$UVICORN_WORKERS"]
+CMD uvicorn server:app --host 0.0.0.0 --port $PORT --workers $UVICORN_WORKERS
