@@ -20,6 +20,10 @@ from typing import Any, List, Union, Optional
 from datetime import timedelta
 import secrets
 import time
+import hmac  # For webhook signature verification
+import requests  # For webhook delivery
+from pydantic import BaseModel, HttpUrl  # For request validation
+from fastapi import Query  # For query parameter validation
 
 import numpy as np
 import whisper
@@ -141,48 +145,32 @@ def update_metrics(status_code: int, duration: float):
     else:
         performance_metrics["error_count"] += 1
 
-@app.get("/metrics")
-async def get_metrics(api_key: str = Depends(verify_api_key)):
-    """Get server performance metrics"""
-    current_metrics = performance_metrics.copy()
-    current_metrics["uptime"] = time.time() - app.startup_time
-    current_metrics["average_response_time"] = round(current_metrics["average_response_time"], 2)
-    return current_metrics
+# Security setup
+security = HTTPBearer(auto_error=False)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global whisper_model
-    app.startup_time = time.time()
+async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API key",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
     
-    # Load the ML model with CPU optimizations
-    logger.info(f"Loading Whisper model: {WHISPER_MODEL}")
-    device = "cpu"
-    logger.info(f"Using device: {device}")
+    if credentials.scheme != "Bearer":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid authentication scheme",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
     
-    # Load model with reduced memory footprint
-    whisper_model = whisper.load_model(
-        WHISPER_MODEL,
-        device=device,
-        in_memory=False,  # Reduce memory usage
-        download_root="/tmp/whisper"  # Cache model files
-    )
+    if credentials.credentials != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
     
-    # Enable CPU optimizations
-    torch.set_num_threads(4)  # Limit CPU threads
-    torch.backends.quantized.engine = 'qnnpack'  # Enable quantization
-    logger.info("Whisper model loaded successfully")
-
-    yield
-
-    # Clean up the ML models and release the resources
-    logger.info("Shutting down, releasing resources")
-    del whisper_model
-    whisper_model = None
-
-
-# Security
-security = HTTPBearer()
-
+    return credentials.credentials
 # Rate limiting setup
 redis_client = Redis(host='redis', port=6379, db=0, decode_responses=True)
 limiter = Limiter(key_func=get_remote_address, storage_uri="redis://redis:6379")
@@ -261,20 +249,6 @@ app.add_middleware(
 )
 
 # Authentication dependency
-async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.scheme != "Bearer":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid authentication scheme",
-        )
-    
-    if credentials.credentials != API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-        )
-    
-    return credentials.credentials
 
 # Generate unique task ID
 def generate_task_id() -> str:
