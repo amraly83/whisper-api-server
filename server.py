@@ -10,8 +10,6 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 import asyncio
-from concurrent.futures import as_completed
-import psutil
 
 import os
 import shutil
@@ -33,7 +31,6 @@ import uvicorn
 import json
 import tempfile
 import hashlib
-import gc  # Import garbage collector module
 
 # Setup basic logging early
 logging.basicConfig(
@@ -206,13 +203,7 @@ limiter = Limiter(key_func=get_remote_address, storage_uri="redis://redis:6379")
 # Global model and async processing
 whisper_model = None
 task_queue = Queue()
-worker_pool = None  # Initialize later
-
-def initialize_worker_pool():
-    """Initialize worker pool with optimal settings"""
-    global worker_pool
-    worker_pool = ThreadPoolExecutor(max_workers=4)
-
+worker_pool = ThreadPoolExecutor(max_workers=4)
 
 # Rate limit configuration (adjust based on server capacity)
 RATE_LIMITS = ["10/minute", "50/hour"]  # Max 10 requests per minute, 50 per hour
@@ -312,73 +303,57 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
     # Update task status
     active_tasks[task_id]["status"] = "processing"
     
-    # Transcribe entire file with memory optimization
-    def transcribe_file():
-        logger.info("Starting transcription process")
-        try:
-            # Load audio in streaming mode
-            audio = whisper.load_audio(audio_path)
-            
-            # Use generator to process in manageable segments
-            def audio_generator():
-                audio_data = whisper.load_audio(audio_path)
-                segment_size = 30 * whisper.audio.SAMPLE_RATE  # 30 seconds
-                for i in range(0, len(audio_data), segment_size):
-                    yield audio_data[i:i+segment_size]
-                del audio_data
-            
-            # Process each segment while maintaining state
-            full_result = {'text': '', 'segments': [], 'language': None}
-            for segment in audio_generator():
-                try:
-                    result = whisper_model.transcribe(segment, **whisper_args)
-                    full_result['text'] += result.get('text', '')
-                    full_result['segments'].extend(result.get('segments', []))
-                    full_result['language'] = full_result['language'] or result.get('language')
-                    
-                    # Manual memory cleanup
-                    del result
-                    import gc
-                    gc.collect()
-                except Exception as e:
-                    logger.error(f"Segment processing failed: {str(e)}")
-                    raise
-            
-            return full_result
-        
-        finally:
-            # Final cleanup
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    # Process audio in chunks to reduce memory usage
+    chunk_size = 30  # seconds
+    audio = whisper.load_audio(audio_path)
+    total_duration = len(audio) / whisper.audio.SAMPLE_RATE
+    transcripts = []
     
-    # Run transcription
-    logger.info("Executing transcription")
-    result = transcribe_file()
-    gc.collect()
-
+    for start in range(0, int(total_duration), chunk_size):
+        end = min(start + chunk_size, total_duration)
+        logger.debug(f"Processing chunk {start}-{end} seconds")
+        
+        # Extract audio chunk
+        start_sample = int(start * whisper.audio.SAMPLE_RATE)
+        end_sample = int(end * whisper.audio.SAMPLE_RATE)
+        audio_chunk = audio[start_sample:end_sample]
+        
+        # Transcribe chunk
+        chunk_transcript = whisper_model.transcribe(
+            audio_chunk,
+            **whisper_args,
+        )
+        transcripts.append(chunk_transcript)
+        
+        # Clear memory
+        del audio_chunk
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    # Combine transcripts
+    combined_transcript = {
+        'text': ' '.join([t['text'] for t in transcripts]),
+        'segments': [seg for t in transcripts for seg in t['segments']],
+        'language': transcripts[0]['language'] if transcripts else None
+    }
     
     elapsed_time = time.time() - start_time
     logger.info(f"Transcription completed in {elapsed_time:.2f} seconds")
     
-    # Optimized memory logging
-    try:
-        if torch.cuda.is_available():
-            mem_usage = torch.cuda.memory_allocated() / 1024**2
-            logger.info(f"GPU memory usage: {mem_usage:.2f} MB")
-        else:
-            process = psutil.Process()
-            mem_usage = process.memory_info().rss / 1024**2
-            logger.info(f"RAM usage: {mem_usage:.2f} MB")
-    finally:
-        # Force garbage collection after measurement
-        import gc
-        gc.collect()
+    # Log memory usage
+    if torch.cuda.is_available():
+        mem_usage = torch.cuda.memory_allocated() / 1024**2
+        logger.info(f"GPU memory usage: {mem_usage:.2f} MB")
+    else:
+        import psutil
+        process = psutil.Process()
+        mem_usage = process.memory_info().rss / 1024**2
+        logger.info(f"RAM usage: {mem_usage:.2f} MB")
+
     # Update task status and cache result
     active_tasks[task_id]["status"] = "complete"
-    active_tasks[task_id]["result"] = result
+    active_tasks[task_id]["result"] = combined_transcript
 
-    return result
+    return combined_transcript
 
 @app.get("/v1/audio/transcriptions/{task_id}")
 async def get_transcription_status(
