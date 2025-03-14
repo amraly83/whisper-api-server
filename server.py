@@ -33,6 +33,7 @@ import uvicorn
 import json
 import tempfile
 import hashlib
+import gc  # Import garbage collector module
 
 # Setup basic logging early
 logging.basicConfig(
