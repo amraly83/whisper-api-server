@@ -286,7 +286,6 @@ WHISPER_DEFAULT_SETTINGS = {
     "no_speech_threshold": 0.6,
     "compression_ratio_threshold": 2.4,
     "condition_on_previous_text": True,
-    "verbose": False,
     "task": "transcribe",
     "fp16": False
 }
@@ -985,7 +984,6 @@ async def transcribe_audio(
         # Apply transcription settings
         settings = WHISPER_DEFAULT_SETTINGS.copy()
         settings['temperature'] = req.temperature
-        settings['temperature_increment_on_fallback'] = 0.2
         if req.language is not None:
             settings['language'] = req.language
         if req.prompt is not None:
