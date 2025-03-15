@@ -572,24 +572,37 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
             end_sample = int(end * 16000)
             audio_chunk = audio[start_sample:end_sample]
             
-            # Transcribe chunk and handle tuple response
-            segments, info = whisper_model.transcribe(
+            # Transcribe chunk - returns tuple of (segments, info)
+            transcription_result = whisper_model.transcribe(
                 audio_chunk,
                 **whisper_args
             )
             
-            # Convert segments to expected format
-            if segments:
-                for segment in segments:
+            # Handle transcription result
+            if transcription_result and len(transcription_result) == 2:
+                segments, info = transcription_result
+                
+                # Convert segments to expected format
+                if segments:
+                    for segment in segments:
+                        all_segments.append({
+                            "start": segment.start + start,
+                            "end": segment.end + start,
+                            "text": segment.text
+                        })
+                    # Get transcript text from segments
+                    transcripts.append(' '.join(segment.text for segment in segments))
+                else:
+                    # Handle empty transcription
                     all_segments.append({
-                        "start": segment.start + start,
-                        "end": segment.end + start,
-                        "text": segment.text
+                        "start": start,
+                        "end": end,
+                        "text": ""
                     })
-                # Get transcript text from segments
-                transcripts.append(' '.join(segment.text for segment in segments))
+                    transcripts.append('')
             else:
-                # Handle empty transcription
+                # Handle invalid transcription result
+                logger.warning(f"Invalid transcription result format: {transcription_result}")
                 all_segments.append({
                     "start": start,
                     "end": end,
