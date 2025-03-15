@@ -284,7 +284,6 @@ WHISPER_DEFAULT_SETTINGS = {
     "temperature": 0.0,
     "temperature_increment_on_fallback": 0.2,
     "no_speech_threshold": 0.6,
-    "logprob_threshold": -1.0,
     "compression_ratio_threshold": 2.4,
     "condition_on_previous_text": True,
     "verbose": False,
@@ -556,6 +555,7 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
         model_last_used = time.time()
         chunk_size = config.CHUNK_SIZE_SECONDS  # seconds
         
+        # Load audio file using faster_whisper's decode_audio
         # Load audio file using faster_whisper's decode_audio
         audio = decode_audio(audio_path)
         total_duration = len(audio) / 16000  # faster-whisper uses fixed 16kHz sample rate
