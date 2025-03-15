@@ -369,11 +369,11 @@ def validate_audio_file(file_path: str) -> bool:
             logger.error("Decoded audio is empty")
             return False
 
-        # RMS-based silence detection
+        # RMS-based silence detection with more lenient threshold
         rms = np.sqrt(np.mean(np.square(audio.astype(np.float32))))
-        if rms < 0.01:  # Adjust threshold as needed
-            logger.warning(f"Silent audio detected (RMS: {rms:.4f})")
-            return False
+        if rms < 0.001:  # More lenient threshold for low-volume audio
+            logger.warning(f"Low volume audio detected (RMS: {rms:.4f})")
+            # Don't reject, just warn as some valid audio might be quiet
 
         if duration > config.MAX_AUDIO_DURATION:
             logger.warning(f"Audio duration exceeds limit: {duration}s")
