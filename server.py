@@ -557,9 +557,8 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
         model_last_used = time.time()
         chunk_size = config.CHUNK_SIZE_SECONDS  # seconds
         
-        # Load full audio - but we'll process in chunks
-        from faster_whisper import Audio
-        audio = Audio().load_audio(audio_path)
+        # Load full audio using the model's feature extractor
+        audio = whisper_model.feature_extractor.load_audio(audio_path)
         total_duration = len(audio) / 16000  # faster-whisper uses fixed 16kHz sample rate
         logger.info(f"Audio duration: {total_duration:.2f} seconds")
         
