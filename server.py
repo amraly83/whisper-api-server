@@ -579,19 +579,22 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
             )
             
             # Convert segments to expected format
-            for segment in segments:
-                all_segments.append({
-                    "start": segment.start + start,
-                    "end": segment.end + start,
-                    "text": segment.text
-                })
-
-            # Get transcript text from info
-            if hasattr(info, 'text'):
-                transcripts.append(info.text)
-            elif hasattr(info, 'transcript'):
-                transcripts.append(info.transcript)
+            if segments:
+                for segment in segments:
+                    all_segments.append({
+                        "start": segment.start + start,
+                        "end": segment.end + start,
+                        "text": segment.text
+                    })
+                # Get transcript text from segments
+                transcripts.append(' '.join(segment.text for segment in segments))
             else:
+                # Handle empty transcription
+                all_segments.append({
+                    "start": start,
+                    "end": end,
+                    "text": ""
+                })
                 transcripts.append('')
 
             # Clear memory after each chunk
