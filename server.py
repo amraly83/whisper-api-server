@@ -30,6 +30,7 @@ import gc
 import subprocess
 from enum import Enum
 import mimetypes
+import numpy as np
 
 try:
     from faster_whisper import WhisperModel
@@ -283,7 +284,7 @@ random = __import__('random')
 WHISPER_DEFAULT_SETTINGS = {
     "temperature": 0.0,
     "temperature_increment_on_fallback": 0.2,
-    "no_speech_threshold": 0.6,
+    "no_speech_threshold": 0.4,  # More sensitive to marginal speech
     "compression_ratio_threshold": 2.4,
     "condition_on_previous_text": True,
     "task": "transcribe",
@@ -359,16 +360,25 @@ def calculate_file_hash(file_path: str) -> str:
     return sha256_hash.hexdigest()
 
 def validate_audio_file(file_path: str) -> bool:
-    """Validate audio file using faster-whisper's decoder"""
+    """Validate audio file including silence check"""
     try:
         audio = decode_audio(file_path)
-        duration = len(audio) / 16000  # Sample rate is 16kHz
-        if duration > config.MAX_AUDIO_DURATION:
-            logger.warning(f"Audio file too long: {duration}s > {config.MAX_AUDIO_DURATION}s")
-            return False
+        duration = len(audio) / 16000
+
         if len(audio) == 0:
             logger.error("Decoded audio is empty")
             return False
+
+        # RMS-based silence detection
+        rms = np.sqrt(np.mean(np.square(audio.astype(np.float32))))
+        if rms < 0.01:  # Adjust threshold as needed
+            logger.warning(f"Silent audio detected (RMS: {rms:.4f})")
+            return False
+
+        if duration > config.MAX_AUDIO_DURATION:
+            logger.warning(f"Audio duration exceeds limit: {duration}s")
+            return False
+            
         return True
     except Exception as e:
         logger.error(f"Audio validation failed: {str(e)}")
@@ -652,49 +662,55 @@ def generate_task_id() -> str:
     return str(uuid.uuid4())
 
 def format_response(result: dict, response_format: str) -> Union[dict, str]:
-    """Format transcription result based on requested format"""
+    """Format transcription result with silent audio handling"""
+    # Base response with fallbacks
+    base = {
+        'text': result.get('text', '').strip() or "No speech detected",
+        'language': result.get('language'),
+        'segments': result.get('segments', []),
+        'duration': result.get('duration', 0.0),
+        'task': result.get('task', 'transcribe')
+    }
+
     if response_format == 'text':
-        return result.get('text', '')
+        return base['text']
         
     elif response_format == 'srt':
         ret = ""
-        for i, seg in enumerate(result.get('segments', []), 1):
-            td_s = timedelta(seconds=seg["start"])
-            td_e = timedelta(seconds=seg["end"])
+        for i, seg in enumerate(base['segments'], 1):
+            td_s = timedelta(seconds=seg.get("start", 0))
+            td_e = timedelta(seconds=seg.get("end", 0))
             
             t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02},{td_s.microseconds//1000:03}'
             t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02},{td_e.microseconds//1000:03}'
             
-            ret += f'{i}\n{t_s} --> {t_e}\n{seg.get("text", "")}\n\n'
-        return ret.strip()
+            ret += f'{i}\n{t_s} --> {t_e}\n{seg.get("text", "[silence]")}\n\n'
+        return ret.strip() or "1\n00:00:00,000 --> 00:00:00,000\n[silence]"
         
     elif response_format == 'vtt':
         ret = "WEBVTT\n\n"
-        for seg in result.get('segments', []):
-            td_s = timedelta(seconds=seg["start"])
-            td_e = timedelta(seconds=seg["end"])
+        for seg in base['segments']:
+            td_s = timedelta(seconds=seg.get("start", 0))
+            td_e = timedelta(seconds=seg.get("end", 0))
             
             t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
             t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
             
-            ret += f"{t_s} --> {t_e}\n{seg.get('text', '')}\n\n"
-        return ret.strip()
+            ret += f"{t_s} --> {t_e}\n{seg.get('text', '[silence]')}\n\n"
+        return ret.strip() or "WEBVTT\n\n00:00:00.000 --> 00:00:00.000\n[silence]"
         
     elif response_format == 'verbose_json':
-        return {
-            'text': result.get('text', ''),
-            'language': result.get('language'),
-            'segments': result.get('segments', []),
-            'duration': result.get('duration', 0.0),
-            'task': result.get('task', 'transcribe')
-        }
+        return {**base, 'segments': [
+            {**seg, 'text': seg.get('text', '[silence]')} 
+            for seg in base['segments']
+        ]}
         
     else:  # json (default)
         return {
-            'text': result.get('text', ''),
-            'language': result.get('language'),
-            'segments': result.get('segments', []),
-            'duration': result.get('duration', 0.0)
+            'text': base['text'],
+            'language': base['language'],
+            'segments': base['segments'],
+            'duration': base['duration']
         }
 
 # Webhook handling
@@ -1040,7 +1056,7 @@ async def transcribe_audio(
                         try:
                             os.unlink(temp_file_path)
                         except Exception as e:
-                            logger.error(f"Failed to remove temp file: {str(e)}")
+                            logger.error("Failed to remove temporary file")
             
             # Start background task
             asyncio.create_task(process_in_background())
@@ -1088,9 +1104,9 @@ async def transcribe_audio(
         if temp_file_path and os.path.exists(temp_file_path):
             try:
                 os.unlink(temp_file_path)
-                logger.debug(f"Removed temporary file: {temp_file_path}")
+                logger.debug("Removed temporary file")
             except Exception as e:
-                logger.error(f"Failed to remove temporary file: {str(e)}")
+                logger.error("Failed to remove temporary file")
 
 def main():
     """Entry point for running the server directly"""
