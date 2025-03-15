@@ -680,7 +680,12 @@ def format_response(result: dict, response_format: str) -> Union[dict, str]:
         return result
         
     else:  # json (default)
-        return {'text': result['text']}
+        return {
+            'text': result['text'],
+            'language': result.get('language'),
+            'segments': result.get('segments', []),
+            'duration': result.get('duration', 0.0)
+        }
 
 # Webhook handling
 webhooks = {}  # {task_id: {"url": webhook_url, "secret": webhook_secret}}
