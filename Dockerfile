@@ -35,24 +35,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
 COPY . /app
 
-# Environment variables
-ENV WHISPER_MODEL=${WHISPER_MODEL:-base}
-ARG API_KEY
-ENV API_KEY=${API_KEY:-default_api_key}
-ENV PORT=${PORT:-8088}
-ENV HOST=${HOST:-0.0.0.0}
-ENV UPLOAD_DIR=${UPLOAD_DIR:-/app/uploads}
-ENV DEBUG=${DEBUG:-false}
-
-# Security settings
-# Maximum file size (default: 50MB)
-ENV MAX_FILE_SIZE=${MAX_FILE_SIZE:-52428800}
-
-# Allowed CORS origins (default: *)
-ENV ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-*}
-
-# Rate limiting configuration (default: 10/minute,50/hour)
-ENV RATE_LIMITS=${RATE_LIMITS:-"10/minute,50/hour"}
+# Environment variables (will be set via .env or docker-compose)
+ENV WHISPER_MODEL=base
+ENV API_KEY=default_api_key
+ENV PORT=8088
+ENV HOST=0.0.0.0
+ENV UPLOAD_DIR=/app/uploads
+ENV DEBUG=false
+ENV MAX_FILE_SIZE=52428800
+ENV ALLOWED_ORIGINS=*
+ENV RATE_LIMITS="10/minute,50/hour"
 
 # Create upload directory
 RUN mkdir -p ${UPLOAD_DIR}
