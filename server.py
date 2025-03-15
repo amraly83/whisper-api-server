@@ -359,23 +359,17 @@ def calculate_file_hash(file_path: str) -> str:
     return sha256_hash.hexdigest()
 
 def validate_audio_file(file_path: str) -> bool:
-    """Validate audio file using ffprobe"""
+    """Validate audio file using faster-whisper's decoder"""
     try:
-        mime_type = mimetypes.guess_type(file_path)[0]
-        if mime_type and mime_type.startswith('audio/'):
-            # Get audio duration using ffprobe
-            cmd = [
-                'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1', file_path
-            ]
-            duration = float(subprocess.check_output(cmd).decode('utf-8').strip())
-            
-            if duration > config.MAX_AUDIO_DURATION:
-                logger.warning(f"Audio file too long: {duration}s > {config.MAX_AUDIO_DURATION}s")
-                return False
-                
-            return True
-        return False
+        audio = decode_audio(file_path)
+        duration = len(audio) / 16000  # Sample rate is 16kHz
+        if duration > config.MAX_AUDIO_DURATION:
+            logger.warning(f"Audio file too long: {duration}s > {config.MAX_AUDIO_DURATION}s")
+            return False
+        if len(audio) == 0:
+            logger.error("Decoded audio is empty")
+            return False
+        return True
     except Exception as e:
         logger.error(f"Audio validation failed: {str(e)}")
         return False
@@ -554,8 +548,10 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
         chunk_size = config.CHUNK_SIZE_SECONDS  # seconds
         
         # Load audio file using faster_whisper's decode_audio
-        # Load audio file using faster_whisper's decode_audio
         audio = decode_audio(audio_path)
+        if len(audio) == 0:
+            raise ValueError("Decoded audio is empty")
+        
         total_duration = len(audio) / 16000  # faster-whisper uses fixed 16kHz sample rate
         logger.info(f"Audio duration: {total_duration:.2f} seconds")
         
@@ -588,10 +584,10 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
                         all_segments.append({
                             "start": segment.start + start,
                             "end": segment.end + start,
-                            "text": segment.text
+                            "text": segment.text.strip()
                         })
                     # Get transcript text from segments
-                    transcripts.append(' '.join(segment.text for segment in segments))
+                    transcripts.append(' '.join(segment.text.strip() for segment in segments))
                 else:
                     # Handle empty transcription
                     all_segments.append({
@@ -617,18 +613,19 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
         # Combine results
+        combined_text = ' '.join(transcripts).strip()
+        if not combined_text:
+            logger.warning("Transcription resulted in empty text")
+        
         combined_transcript = {
-            'text': ' '.join(transcripts).strip(),
+            'text': combined_text,
             'segments': all_segments,
             'language': whisper_args.get('language'),
             'task': whisper_args.get('task', 'transcribe'),
         }
         
         # Add duration
-        if all_segments:
-            combined_transcript['duration'] = all_segments[-1]['end']
-        else:
-            combined_transcript['duration'] = total_duration
+        combined_transcript['duration'] = total_duration if not all_segments else all_segments[-1]['end']
         
         elapsed_time = time.time() - start_time
         logger.info(f"Transcription completed in {elapsed_time:.2f} seconds")
@@ -657,47 +654,44 @@ def generate_task_id() -> str:
 def format_response(result: dict, response_format: str) -> Union[dict, str]:
     """Format transcription result based on requested format"""
     if response_format == 'text':
-        return result['text']
+        return result.get('text', '')
         
     elif response_format == 'srt':
         ret = ""
-        for i, seg in enumerate(result['segments'], 1):
+        for i, seg in enumerate(result.get('segments', []), 1):
             td_s = timedelta(seconds=seg["start"])
             td_e = timedelta(seconds=seg["end"])
             
             t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02},{td_s.microseconds//1000:03}'
             t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02},{td_e.microseconds//1000:03}'
             
-            ret += f'{i}\n{t_s} --> {t_e}\n{seg["text"]}\n\n'
-        return ret
+            ret += f'{i}\n{t_s} --> {t_e}\n{seg.get("text", "")}\n\n'
+        return ret.strip()
         
     elif response_format == 'vtt':
         ret = "WEBVTT\n\n"
-        for seg in result['segments']:
+        for seg in result.get('segments', []):
             td_s = timedelta(seconds=seg["start"])
             td_e = timedelta(seconds=seg["end"])
             
             t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
             t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
             
-            ret += f"{t_s} --> {t_e}\n{seg['text']}\n\n"
-        return ret
+            ret += f"{t_s} --> {t_e}\n{seg.get('text', '')}\n\n"
+        return ret.strip()
         
     elif response_format == 'verbose_json':
-        # Ensure all fields are present
-        result.setdefault('task', 'transcribe')
-        
-        if not result.get('segments') or len(result['segments']) == 0:
-            result['segments'] = [{'start': 0.0, 'end': 0.0, 'text': ''}]
-            result.setdefault('duration', 0.0)
-        else:
-            result.setdefault('duration', result['segments'][-1]['end'])
-            
-        return result
+        return {
+            'text': result.get('text', ''),
+            'language': result.get('language'),
+            'segments': result.get('segments', []),
+            'duration': result.get('duration', 0.0),
+            'task': result.get('task', 'transcribe')
+        }
         
     else:  # json (default)
         return {
-            'text': result['text'],
+            'text': result.get('text', ''),
             'language': result.get('language'),
             'segments': result.get('segments', []),
             'duration': result.get('duration', 0.0)
@@ -720,7 +714,7 @@ def send_webhook_notification(task_id: str):
     }
     
     if task["status"] == TaskStatus.COMPLETE:
-        payload["result"] = {"text": task["result"]["text"]}
+        payload["result"] = {"text": task["result"].get('text', '')}
     elif task["status"] == TaskStatus.FAILED:
         payload["error"] = task.get("error", "Unknown error")
     
@@ -874,7 +868,7 @@ async def get_transcription_status(
     
     return {
         "status": "complete",
-        "text": result['text'],
+        "text": result.get('text', ''),
         "language": result.get('language'),
         "total_segments": total_segments,
         "page": page,
@@ -984,11 +978,11 @@ async def transcribe_audio(
             shutil.copyfileobj(file.file, temp_file)
             temp_file_path = temp_file.name
         
-        # Validate file is audio and get duration
+        # Validate file using faster-whisper's decoder
         if not validate_audio_file(temp_file_path):
             raise HTTPException(
                 status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-                detail="File is not a valid audio file or exceeds maximum duration"
+                detail="Invalid audio file or exceeds maximum duration"
             )
         
         # Calculate file hash for caching
