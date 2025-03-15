@@ -32,11 +32,11 @@ from enum import Enum
 import mimetypes
 
 try:
-    import whisper
+    from faster_whisper import WhisperModel
     import torch
 except ImportError:
     print("Error: Required ML libraries not installed.")
-    print("Install with: pip install openai-whisper torch")
+    print("Install with: pip install faster-whisper ctranslate2 onnxruntime")
     exit(1)
 
 # Enhanced logging with structured format
@@ -123,10 +123,10 @@ class AppConfig:
         self.TASK_RETENTION_HOURS = int(os.environ.get('TASK_RETENTION_HOURS', '24'))
         
         # Model management
-        self.MODEL_UNLOAD_IDLE_MINUTES = int(os.environ.get('MODEL_UNLOAD_IDLE_MINUTES', '30'))
+        self.MODEL_UNLOAD_IDLE_MINUTES = int(os.environ.get('MODEL_UNLOAD_IDLE_MINUTES', '5'))  # More aggressive unloading for 4GB RAM
         
         # Chunking configuration
-        self.CHUNK_SIZE_SECONDS = int(os.environ.get('CHUNK_SIZE_SECONDS', '30'))
+        self.CHUNK_SIZE_SECONDS = int(os.environ.get('CHUNK_SIZE_SECONDS', '15'))  # Smaller chunks for less memory
         self.MAX_AUDIO_DURATION = int(os.environ.get('MAX_AUDIO_DURATION', '300'))  # 5 minutes max
         
 # Request ID middleware for tracking requests
@@ -401,11 +401,13 @@ async def load_whisper_model():
             torch.backends.quantized.engine = 'qnnpack'  # Enable quantization for ARM
             
             # Load model with reduced memory footprint
-            whisper_model = whisper.load_model(
+            whisper_model = WhisperModel(
                 config.WHISPER_MODEL,
-                device=device,
-                in_memory=False,  # Reduce memory usage
-                download_root=config.CACHE_DIR  # Cache model files
+                device="cpu",
+                compute_type="int8",  # Use int8 for CPU optimization
+                download_root=config.CACHE_DIR,
+                cpu_threads=min(2, os.cpu_count() or 2),  # Reduce to 2 threads for better memory usage
+                local_files_only=True  # Prevent model downloads during runtime
             )
             
             # Record metrics
@@ -418,6 +420,11 @@ async def load_whisper_model():
         except Exception as e:
             logger.error(f"Failed to load model: {str(e)}", exc_info=True)
             raise
+        finally:
+            # Ensure resources are cleaned up if loading fails
+            if whisper_model is None:
+                gc.collect()
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
 async def unload_whisper_model_if_idle():
     """Unload whisper model if it's been idle for too long"""
@@ -536,11 +543,13 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
             torch.set_num_threads(min(4, os.cpu_count() or 4))
             torch.backends.quantized.engine = 'qnnpack'
             
-            whisper_model = whisper.load_model(
+            whisper_model = WhisperModel(
                 config.WHISPER_MODEL,
-                device=device,
-                in_memory=False,
-                download_root=config.CACHE_DIR
+                device="cpu",
+                compute_type="int8",
+                download_root=config.CACHE_DIR,
+                cpu_threads=min(2, os.cpu_count() or 2),
+                local_files_only=True
             )
             performance_metrics["model_load_count"] += 1
         
@@ -549,8 +558,9 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
         chunk_size = config.CHUNK_SIZE_SECONDS  # seconds
         
         # Load full audio - but we'll process in chunks
-        audio = whisper.load_audio(audio_path)
-        total_duration = len(audio) / whisper.audio.SAMPLE_RATE
+        from faster_whisper import Audio
+        audio = Audio().load_audio(audio_path)
+        total_duration = len(audio) / 16000  # faster-whisper uses fixed 16kHz sample rate
         logger.info(f"Audio duration: {total_duration:.2f} seconds")
         
         transcripts = []
@@ -562,8 +572,8 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
             logger.debug(f"Processing chunk {start}-{end} seconds")
             
             # Extract audio chunk
-            start_sample = int(start * whisper.audio.SAMPLE_RATE)
-            end_sample = int(end * whisper.audio.SAMPLE_RATE)
+            start_sample = int(start * 16000)  # faster-whisper uses fixed 16kHz sample rate
+            end_sample = int(end * 16000)
             audio_chunk = audio[start_sample:end_sample]
             
             # Transcribe chunk

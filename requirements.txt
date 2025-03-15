@@ -2,9 +2,10 @@ fastapi
 redis==4.5.5
 slowapi==0.1.8
 uvicorn
-openai-whisper
+faster-whisper
+ctranslate2>=3.16.0
+onnxruntime
 torch
-torchaudio
 python-multipart
 numpy
 python-dotenv
