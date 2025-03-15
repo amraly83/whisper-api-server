@@ -33,6 +33,7 @@ import mimetypes
 
 try:
     from faster_whisper import WhisperModel
+    from faster_whisper.audio import decode_audio
     import torch
 except ImportError:
     print("Error: Required ML libraries not installed.")
@@ -535,11 +536,9 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
     start_time = time.time()
     
     try:
-        # Load model synchronously if needed - this is inside executor thread
+        # Load model synchronously if needed
         if whisper_model is None:
-            # We're in a worker thread so we can't use async
             logger.info("Loading model from worker thread")
-            device = "cpu"
             torch.set_num_threads(min(4, os.cpu_count() or 4))
             torch.backends.quantized.engine = 'qnnpack'
             
@@ -549,16 +548,16 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
                 compute_type="int8",
                 download_root=config.CACHE_DIR,
                 cpu_threads=min(2, os.cpu_count() or 2),
-                local_files_only=False  # Allow model downloads from Hugging Face Hub
+                local_files_only=False
             )
             performance_metrics["model_load_count"] += 1
-        
+
         # Process audio in optimized chunks to minimize memory usage
         model_last_used = time.time()
         chunk_size = config.CHUNK_SIZE_SECONDS  # seconds
         
-        # Load full audio using the model's decode_audio method
-        audio = whisper_model.decode_audio(audio_path)
+        # Load audio file using faster_whisper's decode_audio
+        audio = decode_audio(audio_path)
         total_duration = len(audio) / 16000  # faster-whisper uses fixed 16kHz sample rate
         logger.info(f"Audio duration: {total_duration:.2f} seconds")
         
