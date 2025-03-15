@@ -407,7 +407,7 @@ async def load_whisper_model():
                 compute_type="int8",  # Use int8 for CPU optimization
                 download_root=config.CACHE_DIR,
                 cpu_threads=min(2, os.cpu_count() or 2),  # Reduce to 2 threads for better memory usage
-                local_files_only=True  # Prevent model downloads during runtime
+                local_files_only=False  # Allow model downloads from Hugging Face Hub
             )
             
             # Record metrics
@@ -549,7 +549,7 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
                 compute_type="int8",
                 download_root=config.CACHE_DIR,
                 cpu_threads=min(2, os.cpu_count() or 2),
-                local_files_only=True
+                local_files_only=False  # Allow model downloads from Hugging Face Hub
             )
             performance_metrics["model_load_count"] += 1
         
