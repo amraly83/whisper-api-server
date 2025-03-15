@@ -703,9 +703,6 @@ def send_webhook_notification(task_id: str):
     if webhook['secret']:
         signature = hmac.new(
             webhook['secret'].encode(),
-            json.dumps(payload).
-
-    webhook['secret'].encode(),
             json.dumps(payload).encode(),
             hashlib.sha256
         ).hexdigest()
