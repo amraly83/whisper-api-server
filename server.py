@@ -572,20 +572,28 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
             end_sample = int(end * 16000)
             audio_chunk = audio[start_sample:end_sample]
             
-            # Transcribe chunk
-            result = whisper_model.transcribe(
+            # Transcribe chunk and handle tuple response
+            segments, info = whisper_model.transcribe(
                 audio_chunk,
                 **whisper_args
             )
             
-            # Adjust segment timestamps
-            for segment in result["segments"]:
-                segment["start"] += start
-                segment["end"] += start
-                all_segments.append(segment)
-            
-            transcripts.append(result["text"])
-            
+            # Convert segments to expected format
+            for segment in segments:
+                all_segments.append({
+                    "start": segment.start + start,
+                    "end": segment.end + start,
+                    "text": segment.text
+                })
+
+            # Get transcript text from info
+            if hasattr(info, 'text'):
+                transcripts.append(info.text)
+            elif hasattr(info, 'transcript'):
+                transcripts.append(info.transcript)
+            else:
+                transcripts.append('')
+
             # Clear memory after each chunk
             del audio_chunk
             if start % (chunk_size * 3) == 0:  # Every 3 chunks
@@ -596,7 +604,7 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
         combined_transcript = {
             'text': ' '.join(transcripts).strip(),
             'segments': all_segments,
-            'language': whisper_args.get('language') or (result.get('language') if result else None),
+            'language': whisper_args.get('language'),
             'task': whisper_args.get('task', 'transcribe'),
         }
         
