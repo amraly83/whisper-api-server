@@ -288,7 +288,7 @@ WHISPER_DEFAULT_SETTINGS = {
     "compression_ratio_threshold": 2.4,
     "condition_on_previous_text": True,
     "task": "transcribe",
-    "beam_size": 10  # Beam search for better accuracy
+    "beam_size": 4  # Beam search for better accuracy
 }
 
 # Performance metrics
