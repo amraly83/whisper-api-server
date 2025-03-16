@@ -1,3 +1,10 @@
+import torch
+
+# Set PyTorch thread configuration at startup
+torch.set_num_threads(min(4, os.cpu_count() or 4))
+torch.set_num_interop_threads(1)
+torch.backends.quantized.engine = 'qnnpack'
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Form, UploadFile, File, Depends, HTTPException, status, Query
 from fastapi.responses import JSONResponse, Response
