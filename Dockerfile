@@ -32,6 +32,10 @@ WORKDIR /app
 COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
 COPY . /app
 
+# Ensure the necessary Python dependencies are installed in the final stage
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade -r requirements.txt
+
 # Set environment variables
 ENV WHISPER_MODEL=small
 ENV API_KEY=default_api_key
@@ -58,4 +62,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 USER appuser
 
 # Start command with optimized worker configuration
-CMD uvicorn server:app --host 0.0.0.0 --port $PORT --workers $UVICORN_WORKERS
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "$PORT", "--workers", "$UVICORN_WORKERS"]
