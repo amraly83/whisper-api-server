@@ -433,11 +433,11 @@ async def load_whisper_model():
             whisper_model = WhisperModel(
                 config.WHISPER_MODEL,
                 device="cpu",
-                compute_type="int8",  # Use int8 quantization
+                compute_type="float32",  # Use float32 for better compatibility
                 cpu_threads=2,        # Limit CPU threads
                 num_workers=1,        # Reduce worker threads
                 download_root=config.CACHE_DIR,
-                local_files_only=True  # Avoid downloads during runtime
+                local_files_only=False  # Allow downloading from HF Hub
             )
             
             # Record metrics
