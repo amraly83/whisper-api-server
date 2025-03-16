@@ -284,12 +284,11 @@ random = __import__('random')
 WHISPER_DEFAULT_SETTINGS = {
     "temperature": 0.0,
     "temperature_increment_on_fallback": 0.2,
-    "no_speech_threshold": 0.3,  # Lower threshold to be more sensitive to potential speech
-    "logprob_threshold": None,   # Don't filter based on logprob
+    "no_speech_threshold": 0.3,  # Lower threshold to be more sensitive
     "compression_ratio_threshold": 2.4,
     "condition_on_previous_text": True,
     "task": "transcribe",
-    "beam_size": 5  # Increase beam size for better accuracy
+    "beam_size": 5  # Beam search for better accuracy
 }
 
 # Performance metrics
@@ -600,9 +599,23 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
             audio_chunk = audio[start_sample:end_sample]
             
             # Transcribe chunk
+            supported_args = {
+                'language': whisper_args.get('language'),
+                'task': whisper_args.get('task', 'transcribe'),
+                'temperature': whisper_args.get('temperature', [0.0])[0],
+                'no_speech_threshold': whisper_args.get('no_speech_threshold', 0.3),
+                'compression_ratio_threshold': whisper_args.get('compression_ratio_threshold', 2.4),
+                'condition_on_previous_text': whisper_args.get('condition_on_previous_text', True),
+                'beam_size': whisper_args.get('beam_size', 5)
+            }
+            
+            # Remove None values
+            supported_args = {k: v for k, v in supported_args.items() if v is not None}
+            
+            # Transcribe chunk
             transcription_result = whisper_model.transcribe(
                 audio_chunk,
-                **whisper_args
+                **supported_args
             )
             
             # Handle transcription result
@@ -730,7 +743,7 @@ def format_response(result: dict, response_format: str) -> Union[dict, str]:
             td_e = timedelta(seconds=seg.get("end", 0))
             
             t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
-            t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}.{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
+            t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}.{td_e.microseconds//1000:03}'
             
             ret += f"{t_s} --> {t_e}\n{seg.get('text', '[silence]')}\n\n"
         return ret.strip() or "WEBVTT\n\n00:00:00.000 --> 00:00:00.000\n[silence]"
@@ -1056,8 +1069,14 @@ async def transcribe_audio(
             return formatted_response
         
         # Apply transcription settings
-        settings = WHISPER_DEFAULT_SETTINGS.copy()
-        settings['temperature'] = req.temperature
+        settings = {
+            'temperature': req.temperature,
+            'no_speech_threshold': WHISPER_DEFAULT_SETTINGS['no_speech_threshold'],
+            'compression_ratio_threshold': WHISPER_DEFAULT_SETTINGS['compression_ratio_threshold'],
+            'condition_on_previous_text': WHISPER_DEFAULT_SETTINGS['condition_on_previous_text'],
+            'beam_size': WHISPER_DEFAULT_SETTINGS['beam_size']
+        }
+
         if req.language is not None:
             settings['language'] = req.language
         if req.prompt is not None:
