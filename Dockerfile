@@ -2,7 +2,7 @@
 FROM python:3.9-slim AS builder
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
     build-essential \
     git \
     && rm -rf /var/lib/apt/lists/*
@@ -16,8 +16,11 @@ RUN pip install --no-cache-dir --upgrade -r requirements.txt
 # Stage 2: Final
 FROM python:3.9-slim
 
+# Create a non-root user
+RUN useradd -m appuser && chown -R appuser:appuser /usr/local/lib/python3.9
+
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
     ffmpeg \
     curl \
     && rm -rf /var/lib/apt/lists/*
@@ -26,20 +29,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Copy only necessary files from builder stage
-COPY --from=builder /usr/local/lib/python3.9/site-packages/* /usr/local/lib/python3.9/site-packages/
+COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
 COPY . /app
 
-# Create upload directory
+# Set environment variables
+ENV WHISPER_MODEL=small
+ENV API_KEY=default_api_key
+ENV PORT=8088
+ENV HOST=0.0.0.0
 ENV UPLOAD_DIR=/app/uploads
-RUN mkdir -p ${UPLOAD_DIR}
+ENV DEBUG=false
+ENV MAX_FILE_SIZE=52428800
+ENV ALLOWED_ORIGINS=*
+ENV RATE_LIMITS="10/minute,50/hour"
+ENV UVICORN_WORKERS=2
+
+# Create upload directory
+RUN mkdir -p ${UPLOAD_DIR} && chown -R appuser:appuser ${UPLOAD_DIR}
 
 # Expose port
-ENV PORT=8088
 EXPOSE ${PORT}
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -f --max-time 5 http://localhost:8088/health || exit 1
+  CMD curl -f http://localhost:8088/health || exit 1
+
+# Switch to non-root user
+USER appuser
 
 # Start command with optimized worker configuration
-ENTRYPOINT ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "$PORT", "--workers", "$UVICORN_WORKERS"]
+CMD uvicorn server:app --host 0.0.0.0 --port $PORT --workers $UVICORN_WORKERS
