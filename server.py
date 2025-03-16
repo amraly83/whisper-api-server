@@ -1,3 +1,4 @@
+import os
 import torch
 
 # Set PyTorch thread configuration at startup
@@ -17,7 +18,6 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from concurrent.futures import ThreadPoolExecutor
 from pydantic import BaseModel, HttpUrl, Field, field_validator
 import asyncio
-import os
 import shutil
 import logging
 from logging.handlers import RotatingFileHandler
