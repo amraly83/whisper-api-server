@@ -30,9 +30,11 @@ COPY --from=builder /usr/local/lib/python3.9/site-packages/* /usr/local/lib/pyth
 COPY . /app
 
 # Create upload directory
+ENV UPLOAD_DIR=/app/uploads
 RUN mkdir -p ${UPLOAD_DIR}
 
 # Expose port
+ENV PORT=8088
 EXPOSE ${PORT}
 
 # Health check
