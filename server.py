@@ -67,6 +67,10 @@ def setup_logging(log_dir="/var/log/whisper-api", debug=False):
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG if debug else logging.INFO)
     
+    # Remove any existing handlers to prevent duplicate logging
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
     # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(CustomFormatter())
