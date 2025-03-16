@@ -35,7 +35,7 @@ COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python
 COPY . /app
 
 # Environment variables (will be set via .env or docker-compose)
-ENV WHISPER_MODEL=base
+ENV WHISPER_MODEL=small
 ENV API_KEY=default_api_key
 ENV PORT=8088
 ENV HOST=0.0.0.0
