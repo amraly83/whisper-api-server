@@ -537,16 +537,17 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
     # Update task status
     active_tasks[task_id]["status"] = TaskStatus.PROCESSING
     
-    # Set configs for temperature
-    if whisper_args.get("temperature_increment_on_fallback") is not None:
-        whisper_args["temperature"] = [
-            whisper_args["temperature"] + i * whisper_args["temperature_increment_on_fallback"]
-            for i in range(int((1.0 - whisper_args["temperature"]) / whisper_args["temperature_increment_on_fallback"]) + 1)
+    # Handle temperature settings safely
+    temperature_increment = whisper_args.pop('temperature_increment_on_fallback', None)
+    base_temperature = whisper_args.get('temperature', 0.0)
+    
+    if temperature_increment is not None:
+        whisper_args['temperature'] = [
+            base_temperature + i * temperature_increment
+            for i in range(int((1.0 - base_temperature) / temperature_increment) + 1)
         ]
     else:
-        whisper_args["temperature"] = [whisper_args["temperature"]]
-
-    del whisper_args["temperature_increment_on_fallback"]
+        whisper_args['temperature'] = [base_temperature]
 
     logger.debug(f"Transcribing with args: {whisper_args}")
     start_time = time.time()
@@ -1069,19 +1070,24 @@ async def transcribe_audio(
             return formatted_response
         
         # Apply transcription settings
-        settings = {
-            'temperature': req.temperature,
-            'no_speech_threshold': WHISPER_DEFAULT_SETTINGS['no_speech_threshold'],
-            'compression_ratio_threshold': WHISPER_DEFAULT_SETTINGS['compression_ratio_threshold'],
-            'condition_on_previous_text': WHISPER_DEFAULT_SETTINGS['condition_on_previous_text'],
-            'beam_size': WHISPER_DEFAULT_SETTINGS['beam_size']
-        }
-
+        settings = WHISPER_DEFAULT_SETTINGS.copy()  # Start with defaults
+        
+        # Override with request parameters
+        if req.temperature is not None:
+            settings['temperature'] = req.temperature
         if req.language is not None:
             settings['language'] = req.language
         if req.prompt is not None:
             settings['initial_prompt'] = req.prompt
-        
+            
+        # Remove any incompatible settings
+        settings = {k: v for k, v in settings.items() if k in [
+            'temperature', 'temperature_increment_on_fallback',
+            'no_speech_threshold', 'compression_ratio_threshold',
+            'condition_on_previous_text', 'beam_size', 'language',
+            'initial_prompt', 'task'
+        ]}
+
         # For async requests with webhook, process in background
         if webhook_url:
             # Create task for background processing
