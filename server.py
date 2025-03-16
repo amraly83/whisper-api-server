@@ -284,10 +284,12 @@ random = __import__('random')
 WHISPER_DEFAULT_SETTINGS = {
     "temperature": 0.0,
     "temperature_increment_on_fallback": 0.2,
-    "no_speech_threshold": 0.4,  # More sensitive to marginal speech
+    "no_speech_threshold": 0.3,  # Lower threshold to be more sensitive to potential speech
+    "logprob_threshold": None,   # Don't filter based on logprob
     "compression_ratio_threshold": 2.4,
     "condition_on_previous_text": True,
     "task": "transcribe",
+    "beam_size": 5  # Increase beam size for better accuracy
 }
 
 # Performance metrics
@@ -373,13 +375,22 @@ def validate_audio_file(file_path: str) -> bool:
             logger.error("Decoded audio is empty")
             return False
 
-        # RMS-based silence detection with more lenient threshold
+        # More sophisticated audio validation
         rms = np.sqrt(np.mean(np.square(audio.astype(np.float32))))
-        logger.debug(f"Audio RMS: {rms:.4f} (threshold=0.001)")
-        if rms < 0.001:
-            logger.warning(f"Low volume audio detected (RMS: {rms:.4f})")
-            # Don't reject, just warn as some valid audio might be quiet
-
+        logger.debug(f"Audio RMS: {rms:.4f}")
+        
+        # Check if there's any significant audio content
+        frame_length = 1024
+        hop_length = 512
+        frames = np.array([audio[i:i+frame_length] for i in range(0, len(audio)-frame_length, hop_length)])
+        frame_rms = np.sqrt(np.mean(np.square(frames), axis=1))
+        
+        # If we have any frames with significant audio content
+        has_speech = np.any(frame_rms > 0.0005)  # More lenient threshold
+        if not has_speech:
+            logger.warning("No significant audio content detected")
+            # Don't reject yet, let Whisper try to process it
+        
         if duration > config.MAX_AUDIO_DURATION:
             logger.warning(f"Audio duration exceeds limit: {duration}s")
             return False
@@ -558,9 +569,10 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
             )
             performance_metrics["model_load_count"] += 1
 
-        # Process audio in optimized chunks to minimize memory usage
+        # Process audio in optimized chunks with overlap
         model_last_used = time.time()
         chunk_size = config.CHUNK_SIZE_SECONDS  # seconds
+        overlap = 2  # seconds of overlap between chunks
         
         # Load audio file using faster_whisper's decode_audio
         audio = decode_audio(audio_path)
@@ -573,17 +585,21 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
         transcripts = []
         all_segments = []
         
-        # Process in chunks with memory cleanup between chunks
-        for start in range(0, int(total_duration), chunk_size):
-            end = min(start + chunk_size, total_duration)
-            logger.debug(f"Processing chunk {start}-{end} seconds")
+        # Process in chunks with overlap
+        current_pos = 0
+        while current_pos < int(total_duration):
+            end_pos = min(current_pos + chunk_size, total_duration)
+            
+            # Calculate chunk boundaries with overlap
+            start_sample = max(0, int((current_pos - overlap) * 16000))
+            end_sample = min(len(audio), int((end_pos + overlap) * 16000))
+            
+            logger.debug(f"Processing chunk {current_pos}-{end_pos} seconds")
             
             # Extract audio chunk
-            start_sample = int(start * 16000)  # faster-whisper uses fixed 16kHz sample rate
-            end_sample = int(end * 16000)
             audio_chunk = audio[start_sample:end_sample]
             
-            # Transcribe chunk - returns tuple of (segments, info)
+            # Transcribe chunk
             transcription_result = whisper_model.transcribe(
                 audio_chunk,
                 **whisper_args
@@ -593,54 +609,69 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
             if transcription_result and len(transcription_result) == 2:
                 segments, info = transcription_result
                 
-                # Convert segments to expected format
+                # Convert segments to expected format and adjust timestamps
                 if segments:
                     for segment in segments:
-                        all_segments.append({
-                            "start": segment.start + start,
-                            "end": segment.end + start,
-                            "text": segment.text.strip()
-                        })
-                    # Get transcript text from segments
-                    transcripts.append(' '.join(segment.text.strip() for segment in segments))
-                else:
-                    # Handle empty transcription
-                    all_segments.append({
-                        "start": start,
-                        "end": end,
-                        "text": ""
-                    })
-                    transcripts.append('')
-            else:
-                # Handle invalid transcription result
-                logger.warning(f"Invalid transcription result format: {transcription_result}")
-                all_segments.append({
-                    "start": start,
-                    "end": end,
-                    "text": ""
-                })
-                transcripts.append('')
+                        # Adjust segment timestamps to account for chunk position and overlap
+                        segment_start = segment.start + (current_pos - overlap)
+                        segment_end = segment.end + (current_pos - overlap)
+                        
+                        # Only include segments that fall within the current chunk (excluding overlap)
+                        if segment_end > current_pos and segment_start < end_pos:
+                            all_segments.append({
+                                "start": max(0, segment_start),
+                                "end": min(total_duration, segment_end),
+                                "text": segment.text.strip()
+                            })
+                    
+                    # Get transcript text from valid segments
+                    chunk_text = ' '.join(segment.text.strip() for segment in segments 
+                                        if segment.end + (current_pos - overlap) > current_pos 
+                                        and segment.start + (current_pos - overlap) < end_pos)
+                    if chunk_text:
+                        transcripts.append(chunk_text)
 
             # Clear memory after each chunk
             del audio_chunk
-            if start % (chunk_size * 3) == 0:  # Every 3 chunks
+            if len(transcripts) % 3 == 0:  # Every 3 chunks
                 gc.collect()
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            
+            # Move to next chunk
+            current_pos = end_pos
+        
+        # Combine results and remove duplicates
+        # Sort segments by start time
+        all_segments.sort(key=lambda x: x["start"])
+        
+        # Remove duplicate or overlapping segments
+        if all_segments:
+            filtered_segments = [all_segments[0]]
+            for segment in all_segments[1:]:
+                prev = filtered_segments[-1]
+                # Check if segments overlap significantly
+                if segment["start"] > prev["end"] - 0.5:  # Allow small overlap
+                    filtered_segments.append(segment)
+                elif segment["text"] != prev["text"]:  # Different text, might be a correction
+                    if len(segment["text"]) > len(prev["text"]):  # Keep the longer text
+                        filtered_segments[-1] = segment
+        else:
+            filtered_segments = []
         
         # Combine results
-        combined_text = ' '.join(transcripts).strip()
+        combined_text = ' '.join(s["text"] for s in filtered_segments).strip()
         if not combined_text:
             logger.warning("Transcription resulted in empty text")
         
         combined_transcript = {
             'text': combined_text,
-            'segments': all_segments,
+            'segments': filtered_segments,
             'language': whisper_args.get('language'),
             'task': whisper_args.get('task', 'transcribe'),
         }
         
         # Add duration
-        combined_transcript['duration'] = total_duration if not all_segments else all_segments[-1]['end']
+        combined_transcript['duration'] = total_duration if not filtered_segments else filtered_segments[-1]['end']
         
         elapsed_time = time.time() - start_time
         logger.info(f"Transcription completed in {elapsed_time:.2f} seconds")
@@ -699,7 +730,7 @@ def format_response(result: dict, response_format: str) -> Union[dict, str]:
             td_e = timedelta(seconds=seg.get("end", 0))
             
             t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
-            t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
+            t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}.{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
             
             ret += f"{t_s} --> {t_e}\n{seg.get('text', '[silence]')}\n\n"
         return ret.strip() or "WEBVTT\n\n00:00:00.000 --> 00:00:00.000\n[silence]"
