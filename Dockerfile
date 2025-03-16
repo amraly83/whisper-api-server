@@ -29,9 +29,6 @@ WORKDIR /app
 COPY --from=builder /usr/local/lib/python3.9/site-packages/* /usr/local/lib/python3.9/site-packages/
 COPY . /app
 
-# Load environment variables from .env file
-ENV_FILE=.env
-
 # Create upload directory
 RUN mkdir -p ${UPLOAD_DIR}
 
