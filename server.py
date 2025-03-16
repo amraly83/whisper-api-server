@@ -437,11 +437,6 @@ async def load_whisper_model():
         logger.info(f"Loading Whisper model: {config.WHISPER_MODEL}")
         
         try:
-            # Optimize CPU performance
-            torch.set_num_threads(min(4, os.cpu_count() or 4))
-            torch.set_num_interop_threads(1)  # Reduce inter-op parallelism
-            torch.backends.quantized.engine = 'qnnpack'
-            
             # Load model with optimized settings
             whisper_model = WhisperModel(
                 config.WHISPER_MODEL,
