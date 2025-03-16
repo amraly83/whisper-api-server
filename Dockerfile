@@ -49,9 +49,9 @@ ENV RATE_LIMITS="10/minute,50/hour"
 ENV CACHE_DIR=/tmp/whisper-cache
 
 # Create directories and set permissions
-RUN mkdir -p ${UPLOAD_DIR} /tmp/whisper-cache && \
-    chown -R nobody:nogroup ${UPLOAD_DIR} /tmp/whisper-cache /app && \
-    chmod -R 755 ${UPLOAD_DIR} /tmp/whisper-cache /app
+RUN mkdir -p ${UPLOAD_DIR} /tmp/whisper-cache /var/log/whisper-api && \
+    chown -R nobody:nogroup ${UPLOAD_DIR} /tmp/whisper-cache /app /var/log/whisper-api && \
+    chmod -R 755 ${UPLOAD_DIR} /tmp/whisper-cache /app /var/log/whisper-api
 
 # Switch to non-root user
 USER nobody
