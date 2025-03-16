@@ -127,10 +127,16 @@ class AppConfig:
         # Model management
         self.MODEL_UNLOAD_IDLE_MINUTES = int(os.environ.get('MODEL_UNLOAD_IDLE_MINUTES', '5'))  # More aggressive unloading for 4GB RAM
         
-        # Chunking configuration
-        self.CHUNK_SIZE_SECONDS = int(os.environ.get('CHUNK_SIZE_SECONDS', '15'))  # Smaller chunks for less memory
+        # Chunking configuration - optimized for real-time
+        self.CHUNK_SIZE_SECONDS = int(os.environ.get('CHUNK_SIZE_SECONDS', '10'))  # Reduced for faster processing
+        self.CHUNK_OVERLAP = float(os.environ.get('CHUNK_OVERLAP', '0.5'))  # Reduced overlap
         self.MAX_AUDIO_DURATION = int(os.environ.get('MAX_AUDIO_DURATION', '300'))  # 5 minutes max
         
+        # Memory optimization
+        self.MEMORY_THRESHOLD = float(os.environ.get('MEMORY_THRESHOLD', '0.85'))
+        self.GC_FREQUENCY = int(os.environ.get('GC_FREQUENCY', '2'))  # Run GC every N chunks
+        self.MODEL_UNLOAD_IDLE_MINUTES = int(os.environ.get('MODEL_UNLOAD_IDLE_MINUTES', '2'))  # More aggressive unloading
+
 # Request ID middleware for tracking requests
 class RequestIDMiddleware:
     async def __call__(self, request: Request, call_next):
@@ -283,12 +289,15 @@ random = __import__('random')
 
 WHISPER_DEFAULT_SETTINGS = {
     "temperature": 0.0,
-    "temperature_increment_on_fallback": 0.2,
-    "no_speech_threshold": 0.25,  # Lower threshold to be more sensitive
+    "no_speech_threshold": 0.25,  # More sensitive speech detection
     "compression_ratio_threshold": 2.4,
     "condition_on_previous_text": True,
     "task": "transcribe",
-    "beam_size": 4  # Beam search for better accuracy
+    "beam_size": 1,  # Reduced beam size for faster inference
+    "best_of": 1,    # Only keep best result
+    "max_initial_timestamp": 1.0,  # Fast initial timestamp detection
+    "vad_filter": True,  # Enable voice activity detection
+    "vad_threshold": 0.25  # Lower VAD threshold for better sensitivity
 }
 
 # Performance metrics
@@ -410,21 +419,22 @@ async def load_whisper_model():
             return whisper_model
             
         logger.info(f"Loading Whisper model: {config.WHISPER_MODEL}")
-        device = "cpu"  # Force CPU mode for 4GB RAM constraint
         
         try:
-            # Optimize for CPU with limited memory
-            torch.set_num_threads(min(4, os.cpu_count() or 4))  # Limit CPU threads
-            torch.backends.quantized.engine = 'qnnpack'  # Enable quantization for ARM
+            # Optimize CPU performance
+            torch.set_num_threads(min(4, os.cpu_count() or 4))
+            torch.set_num_interop_threads(1)  # Reduce inter-op parallelism
+            torch.backends.quantized.engine = 'qnnpack'
             
-            # Load model with reduced memory footprint
+            # Load model with optimized settings
             whisper_model = WhisperModel(
                 config.WHISPER_MODEL,
                 device="cpu",
-                compute_type="int8",  # Use int8 for CPU optimization
+                compute_type="int8",  # Use int8 quantization
+                cpu_threads=2,        # Limit CPU threads
+                num_workers=1,        # Reduce worker threads
                 download_root=config.CACHE_DIR,
-                cpu_threads=min(2, os.cpu_count() or 2),  # Reduce to 2 threads for better memory usage
-                local_files_only=False  # Allow model downloads from Hugging Face Hub
+                local_files_only=True  # Avoid downloads during runtime
             )
             
             # Record metrics
@@ -438,7 +448,6 @@ async def load_whisper_model():
             logger.error(f"Failed to load model: {str(e)}", exc_info=True)
             raise
         finally:
-            # Ensure resources are cleaned up if loading fails
             if whisper_model is None:
                 gc.collect()
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -572,7 +581,7 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
         # Process audio in optimized chunks with overlap
         model_last_used = time.time()
         chunk_size = config.CHUNK_SIZE_SECONDS  # seconds
-        overlap = 2  # seconds of overlap between chunks
+        overlap = config.CHUNK_OVERLAP  # seconds of overlap between chunks
         
         # Load audio file using faster_whisper's decode_audio
         audio = decode_audio(audio_path)
@@ -647,7 +656,7 @@ def transcribe(audio_path: str, task_id: str, **whisper_args):
 
             # Clear memory after each chunk
             del audio_chunk
-            if len(transcripts) % 3 == 0:  # Every 3 chunks
+            if len(transcripts) % config.GC_FREQUENCY == 0:  # Run GC every N chunks
                 gc.collect()
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
             

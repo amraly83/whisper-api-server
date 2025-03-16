@@ -7,32 +7,43 @@ services:
     env_file:
       - .env
     environment:
-      # Only essential overrides here
       PORT: ${PORT:-8088}
       HOST: ${HOST:-0.0.0.0}
+      WHISPER_MODEL: "base"  # Using base model for faster inference
+      CHUNK_SIZE_SECONDS: "10"
+      CHUNK_OVERLAP: "0.5"
+      GC_FREQUENCY: "2"
+      MODEL_UNLOAD_IDLE_MINUTES: "2"
+      MAX_CONCURRENT_TASKS: "2"  # Reduced for better memory management
     ports:
       - "8088:8088"
     deploy:
       resources:
         limits:
-          memory: 3g # Limit to 3GB out of 4GB available
+          memory: 3g
+          cpus: '2'
         reservations:
           memory: 512m
+          cpus: '1'
     volumes:
       - uploads:/app/uploads
+      - whisper_cache:/app/whisper_cache  # Persist model cache
     restart: unless-stopped
 
   redis:
     image: "redis:alpine"
     container_name: "whisper-api-redis"
+    command: redis-server --save 60 1 --loglevel warning --maxmemory 384mb --maxmemory-policy allkeys-lru
     restart: unless-stopped
     deploy:
       resources:
         limits:
-          memory: 512mb
+          memory: 384mb
+          cpus: '0.5'
     volumes:
       - redis_data:/data
 
 volumes:
   uploads:
   redis_data:
+  whisper_cache:
