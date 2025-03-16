@@ -29,17 +29,8 @@ WORKDIR /app
 COPY --from=builder /usr/local/lib/python3.9/site-packages/* /usr/local/lib/python3.9/site-packages/
 COPY . /app
 
-# Environment variables (will be set via .env or docker-compose)
-# Consider using a .env file or docker-compose.yml instead of hardcoding these
-ENV WHISPER_MODEL=base
-ENV API_KEY=default_api_key
-ENV PORT=8088
-ENV HOST=0.0.0.0
-ENV UPLOAD_DIR=/app/uploads
-ENV DEBUG=false
-ENV MAX_FILE_SIZE=52428800
-ENV ALLOWED_ORIGINS=*
-ENV RATE_LIMITS="10/minute,50/hour"
+# Load environment variables from .env file
+ENV_FILE=.env
 
 # Create upload directory
 RUN mkdir -p ${UPLOAD_DIR}
@@ -50,9 +41,6 @@ EXPOSE ${PORT}
 # Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD curl -f --max-time 5 http://localhost:8088/health || exit 1
-
-# Optimize Uvicorn workers based on memory constraints
-ENV UVICORN_WORKERS=2
 
 # Start command with optimized worker configuration
 ENTRYPOINT ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "$PORT", "--workers", "$UVICORN_WORKERS"]
