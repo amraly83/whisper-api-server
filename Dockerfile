@@ -37,7 +37,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
 # Set environment variables
-ENV WHISPER_MODEL=small
+ENV WHISPER_MODEL=base
 ENV API_KEY=default_api_key
 ENV PORT=8088
 ENV HOST=0.0.0.0
@@ -50,6 +50,9 @@ ENV UVICORN_WORKERS=2
 
 # Create upload directory
 RUN mkdir -p ${UPLOAD_DIR} && chown -R appuser:appuser ${UPLOAD_DIR}
+
+# Ensure the directory where `uvicorn` is installed is in the PATH
+ENV PATH="/usr/local/lib/python3.9/site-packages:$PATH"
 
 # Expose port
 EXPOSE ${PORT}
