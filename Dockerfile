@@ -41,16 +41,17 @@ ENV WHISPER_MODEL=base
 ENV API_KEY=default_api_key
 ENV PORT=8088
 ENV HOST=0.0.0.0
-ENV UPLOAD_DIR=/app/uploads
+ENV UPLOAD_DIR=/tmp/uploads
 ENV DEBUG=false
 ENV MAX_FILE_SIZE=52428800
 ENV ALLOWED_ORIGINS=*
 ENV RATE_LIMITS="10/minute,50/hour"
-ENV CACHE_DIR=/app/whisper_cache
+ENV CACHE_DIR=/tmp/whisper-cache
 
-# Create directories
-RUN mkdir -p ${UPLOAD_DIR} ${CACHE_DIR} \
-    && chown -R nobody:nogroup ${UPLOAD_DIR} ${CACHE_DIR}
+# Create directories and set permissions
+RUN mkdir -p ${UPLOAD_DIR} /tmp/whisper-cache && \
+    chown -R nobody:nogroup ${UPLOAD_DIR} /tmp/whisper-cache /app && \
+    chmod -R 755 ${UPLOAD_DIR} /tmp/whisper-cache /app
 
 # Switch to non-root user
 USER nobody
@@ -59,4 +60,4 @@ USER nobody
 EXPOSE ${PORT}
 
 # Start command with optimized worker configuration
-CMD ["sh", "-c", "python -OO -u server.py"]
+CMD ["python", "-OO", "server.py"]

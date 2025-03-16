@@ -222,13 +222,15 @@ class TranscriptionRequest(BaseModel):
     prompt: Optional[str] = Field(None, description="Initial prompt for transcription")
     temperature: Optional[float] = Field(0.0, description="Sampling temperature (0.0 to 1.0)")
     
-    @validator('model')
+    @field_validator('model')
+    @classmethod
     def validate_model(cls, v):
         if v != "whisper-1":
             raise ValueError("Only 'whisper-1' model is supported")
         return v
     
-    @validator('response_format')
+    @field_validator('response_format')
+    @classmethod
     def validate_format(cls, v):
         if v is None:
             return 'json'
@@ -236,7 +238,8 @@ class TranscriptionRequest(BaseModel):
             raise ValueError(f"Unsupported format: {v}")
         return v
     
-    @validator('temperature')
+    @field_validator('temperature')
+    @classmethod
     def validate_temperature(cls, v):
         if v is None:
             return 0.0
