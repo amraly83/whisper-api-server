@@ -284,11 +284,11 @@ random = __import__('random')
 WHISPER_DEFAULT_SETTINGS = {
     "temperature": 0.0,
     "temperature_increment_on_fallback": 0.2,
-    "no_speech_threshold": 0.3,  # Lower threshold to be more sensitive
+    "no_speech_threshold": 0.25,  # Lower threshold to be more sensitive
     "compression_ratio_threshold": 2.4,
     "condition_on_previous_text": True,
     "task": "transcribe",
-    "beam_size": 5  # Beam search for better accuracy
+    "beam_size": 10  # Beam search for better accuracy
 }
 
 # Performance metrics
