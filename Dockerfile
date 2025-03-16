@@ -55,4 +55,5 @@ EXPOSE ${PORT}
 ENV UVICORN_WORKERS=2
 
 # Start command with optimized worker configuration
-CMD uvicorn server:app --host 0.0.0.0 --port $PORT --workers $UVICORN_WORKERS
+# CMD uvicorn server:app --host 0.0.0.0 --port $PORT --workers $UVICORN_WORKERS
+CMD ["gunicorn", "--workers", "$UVICORN_WORKERS", "--bind", "0.0.0.0:$PORT", "server:app"]
