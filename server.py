@@ -202,7 +202,7 @@ class Webhook(BaseModel):
     secret: Optional[str] = None
     
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "url": "https://example.com/webhook",
                 "secret": "your_webhook_secret"
