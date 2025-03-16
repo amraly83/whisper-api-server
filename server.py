@@ -8,7 +8,7 @@ from slowapi.errors import RateLimitExceeded
 from redis import Redis
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from concurrent.futures import ThreadPoolExecutor
-from pydantic import BaseModel, HttpUrl, Field, validator
+from pydantic import BaseModel, HttpUrl, Field, field_validator
 import asyncio
 import os
 import shutil
