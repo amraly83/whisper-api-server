@@ -1,11 +1,13 @@
 import os
 import torch
 
-# Set PyTorch thread configuration at startup
-torch.set_num_threads(min(4, os.cpu_count() or 4))
-torch.set_num_interop_threads(1)
-torch.backends.quantized.engine = 'qnnpack'
+def configure_pytorch():
+    """Configure PyTorch thread settings before any parallel work starts"""
+    torch.set_num_threads(min(4, os.cpu_count() or 4))
+    torch.set_num_interop_threads(1)
+    torch.backends.quantized.engine = 'qnnpack'
 
+# Import all other modules after PyTorch configuration
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Form, UploadFile, File, Depends, HTTPException, status, Query
 from fastapi.responses import JSONResponse, Response
@@ -1194,8 +1196,10 @@ async def transcribe_audio(
 
 def main():
     """Entry point for running the server directly"""
-    # Validate configuration
     try:
+        # Configure PyTorch first
+        configure_pytorch()
+        
         # Set up metrics logging thread
         log_system_metrics()
         
